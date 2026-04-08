@@ -1,0 +1,21 @@
+{
+  "model": "mistral:7b",
+  "voice_input": false,
+  "voice_output": false,
+  "voice_key": "right_ctrl",
+  "voice_speed": 1.0,
+  "session_memory": false,
+  "session_memory_turns": 8,
+  "allowed_paths": [
+    "C:/Users/gkv47"
+  ],
+  "blocked_paths": [
+    "C:/Windows",
+    "C:/Program Files"
+  ],
+  "pin_hash": "",
+  "trash_dir": ".atlas_trash",
+  "trash_retention_days": 7,
+  "log_file": "history.db",
+  "api_token": "7d74eabc-15c0-499a-8e6f-bf2ed55d67c0"
+}
