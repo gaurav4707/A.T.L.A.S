@@ -215,6 +215,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Added
 config.json
 macros.json
 history.db
@@ -223,3 +224,5 @@ error.log
 .atlas_trash/
 .atlas_chroma/
 *.mp3
+pip_cache/
+*.whl
