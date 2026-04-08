@@ -1,18 +1,22 @@
-"""ATLAS Phase 3 CLI with history, macros, dry-run, and FastAPI integration."""
+"""ATLAS Phase 4 CLI with startup polish, voice support, and session memory."""
 
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 import requests
 import uvicorn
 from rich.console import Console
+from rich import box
 from rich.panel import Panel
 from rich.table import Table
 
@@ -22,25 +26,42 @@ import executor
 import history
 import llm_engine
 import macros
+import rollback
 import security
 import settings
+import voice
 
 console = Console()
+NO_MEMORY_SYSTEM_PROMPT = "You have no memory of previous sessions. Treat each command as independent."
+logging.basicConfig(filename="error.log", level=logging.ERROR, format="%(asctime)s | %(message)s")
 
 
 def _update_session_context(
-    session_context: list[str],
+    session_context: deque[str],
     text: str,
-    result: dict[str, Any],
+    assistant_text: str,
     session_memory_turns: int,
 ) -> None:
     """Append exchange and trim to configured session memory window."""
     session_context.append(f"User: {text}")
-    session_context.append(f"ATLAS: {result}")
+    session_context.append(f"ATLAS: {assistant_text}")
 
     max_items = max(1, session_memory_turns) * 2
     if len(session_context) > max_items:
-        del session_context[:-max_items]
+        while len(session_context) > max_items:
+            session_context.popleft()
+
+
+def _load_config_with_guard() -> dict[str, Any]:
+    """Validate raw config JSON then return normalized loaded settings."""
+    config_path = Path(__file__).resolve().parent / "config.json"
+    try:
+        if config_path.exists():
+            json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        print("config.json is broken. Delete it and run atlas --setup.")
+        sys.exit(1)
+    return settings.load()
 
 
 def _run_setup() -> int:
@@ -55,6 +76,31 @@ def _run_setup() -> int:
         return 1
     console.print("[green]Setup complete: PIN configured and Ollama reachable.[/green]")
     return 0
+
+
+def _check_ollama_ready() -> None:
+    """Ensure Ollama service is available before running CLI commands."""
+    try:
+        requests.get("http://localhost:11434", timeout=2)
+    except requests.RequestException:
+        print("Ollama is not running. Start it with: ollama serve")
+        sys.exit(1)
+
+
+def _print_model_hint(config: dict[str, Any]) -> None:
+    """Print llama3 suggestion when available but mistral is configured."""
+    try:
+        result = subprocess.run(
+            ["ollama", "list"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        output = (result.stdout or "").lower()
+        if "llama3" in output and str(config.get("model", "")).lower().startswith("mistral"):
+            console.print("[dim]Tip: LLaMA 3 8B is available. Set model: llama3 in config.json[/dim]")
+    except OSError:
+        return
 
 
 def _install_cli_entrypoint() -> int:
@@ -118,12 +164,12 @@ def _classify_or_query(text: str, llm_context: list[str]) -> dict[str, Any]:
 
 def _execute_text_command(
     text: str,
-    session_context: list[str],
+    session_context: deque[str],
     session_memory_enabled: bool,
     session_memory_turns: int,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Execute one free-text command and log its outcome in history."""
-    llm_context = session_context if session_memory_enabled else []
+    llm_context = list(session_context) if session_memory_enabled else [NO_MEMORY_SYSTEM_PROMPT]
     started = time.perf_counter()
     parsed = _classify_or_query(text, llm_context)
 
@@ -143,15 +189,18 @@ def _execute_text_command(
         risk=str(parsed.get("risk", "")),
     )
 
+    assistant_response = str(parsed.get("response", execution_result.get("message", "")))
     if session_memory_enabled:
-        _update_session_context(session_context, text, parsed, session_memory_turns)
+        _update_session_context(session_context, text, assistant_response, session_memory_turns)
 
-    return execution_result
+    voice.speak(assistant_response)
+
+    return parsed, execution_result
 
 
-def _dry_run_panel(text: str, session_context: list[str], session_memory_enabled: bool) -> None:
+def _dry_run_panel(text: str, session_context: deque[str], session_memory_enabled: bool) -> None:
     """Print exact dry-run block without executing any action."""
-    llm_context = session_context if session_memory_enabled else []
+    llm_context = list(session_context) if session_memory_enabled else [NO_MEMORY_SYSTEM_PROMPT]
     parsed = _classify_or_query(text, llm_context)
     action = str(parsed.get("action", "unknown"))
     params = parsed.get("params", {})
@@ -174,13 +223,14 @@ def _dry_run_panel(text: str, session_context: list[str], session_memory_enabled
     elif risk == "critical":
         gate = "blocked"
 
-    print("┌─ Dry Run ──────────────────────────────┐")
-    print(f"│ ACTION: {action} │")
-    print(f"│ TARGET: {target} │")
-    print(f"│ RISK: {risk.capitalize()} │")
-    print(f"│ GATE: {gate} │")
-    print("│ → Not executed. Remove --dry to run. │")
-    print("└────────────────────────────────────────┘")
+    body = (
+        f"ACTION: {action}\n"
+        f"TARGET: {target}\n"
+        f"RISK: {risk.capitalize()}\n"
+        f"GATE: {gate}\n"
+        "-> Not executed. Remove --dry to run."
+    )
+    console.print(Panel(body, title="Dry Run", border_style="yellow", box=box.ASCII))
 
 
 def _render_history(rows: list[dict[str, Any]]) -> None:
@@ -243,22 +293,23 @@ def _show_status(config: dict[str, Any]) -> int:
 
 def _show_help_panel() -> None:
     """Render command help using a compact Rich panel."""
-    lines = [
-        "atlas 'cmd'                Run single command",
-        "atlas                      Start REPL",
-        "atlas --dry 'cmd'          Preview parse only",
-        "atlas --history            Show last 20 commands",
-        "atlas --history search kw  Search history",
-        "atlas --rerun N            Re-run history row",
-        "atlas --macro list         List macros",
-        "atlas --macro run NAME     Run macro",
-        "atlas --macro run NAME X   Run macro with input",
-        "atlas --macro add          Open macros.json",
-        "atlas --status             Show status panel",
-        "atlas --setup              PIN + Ollama setup",
-        "atlas --install-cli        Add console entrypoint",
-    ]
-    console.print(Panel("\n".join(lines), title="ATLAS Help"))
+    help_table = Table.grid(expand=True)
+    help_table.add_column(style="cyan", ratio=2)
+    help_table.add_column(ratio=4)
+    help_table.add_row("atlas 'cmd'", "Run single command")
+    help_table.add_row("atlas", "Start REPL")
+    help_table.add_row("atlas --dry 'cmd'", "Preview parse only")
+    help_table.add_row("atlas --history", "Show last 20 commands")
+    help_table.add_row("atlas --history search kw", "Search history")
+    help_table.add_row("atlas --rerun N", "Re-run history row")
+    help_table.add_row("atlas --macro list", "List macros")
+    help_table.add_row("atlas --macro run NAME", "Run macro")
+    help_table.add_row("atlas --macro run NAME X", "Run macro with input")
+    help_table.add_row("atlas --macro add", "Open macros.json")
+    help_table.add_row("atlas --status", "Show status panel")
+    help_table.add_row("atlas --setup", "PIN wizard + Ollama check")
+    help_table.add_row("atlas --install-cli", "Add console entrypoint")
+    console.print(Panel(help_table, title="ATLAS Help", border_style="blue"))
 
 
 def _parse_args() -> argparse.Namespace:
@@ -277,7 +328,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Run the ATLAS Phase 3 CLI modes and interactive REPL."""
+    """Run the ATLAS Phase 4 CLI modes and interactive REPL."""
     try:
         import readline  # type: ignore # noqa: F401
     except Exception:
@@ -298,18 +349,44 @@ def main() -> None:
     if args.setup:
         sys.exit(_run_setup())
 
-    config = settings.load()
+    # Startup order: load config -> purge -> check Ollama -> PIN -> API -> poll -> voice -> banner.
+    config = _load_config_with_guard()
+    rollback.auto_purge()
+    _check_ollama_ready()
+    if not str(config.get("pin_hash", "")).strip():
+        security.setup_pin()
+        config = settings.load()
     _start_api_server()
 
-    if config.get("needs_pin_setup", False):
-        console.print("First-run setup required.")
-        if not security.setup_pin():
-            console.print("PIN setup incomplete. Exiting ATLAS.")
-            return
-
-    session_context: list[str] = []
+    session_context: deque[str] = deque(maxlen=max(1, int(config.get("session_memory_turns", 8))) * 2)
     session_memory_enabled = bool(config.get("session_memory", False))
     session_memory_turns = int(config.get("session_memory_turns", 8))
+
+    def _voice_dispatch(voice_text: str) -> None:
+        """Dispatch transcribed voice text through the same execution pipeline."""
+        try:
+            _parsed, voice_result = _execute_text_command(
+                voice_text,
+                session_context,
+                session_memory_enabled,
+                session_memory_turns,
+            )
+            border = "green" if bool(voice_result.get("success", False)) else "red"
+            console.print(Panel.fit(str(voice_result), title="ATLAS Voice", border_style=border))
+        except Exception as exc:
+            logging.error("Voice dispatch failed: %s", exc)
+
+    voice.set_command_handler(_voice_dispatch)
+    if bool(config.get("voice_input", False)):
+        voice.start_ptt_listener()
+
+    banner = (
+        f"ATLAS v1 | Model: {config.get('model')} | "
+        f"Voice: {'on' if bool(config.get('voice_input') or config.get('voice_output')) else 'off'} | "
+        f"Memory: {'on' if bool(config.get('session_memory')) else 'off'} | --help for commands"
+    )
+    console.print(Panel.fit(banner, border_style="blue"))
+    _print_model_hint(config)
 
     if args.status:
         sys.exit(_show_status(config))
@@ -327,7 +404,8 @@ def main() -> None:
 
     if args.rerun_id is not None:
         result = history.rerun(args.rerun_id)
-        console.print(Panel.fit(str(result), title="Rerun"))
+        border = "green" if bool(result.get("success", False)) else "red"
+        console.print(Panel.fit(str(result), title="Rerun", border_style=border))
         return
 
     if args.macro_args:
@@ -337,19 +415,21 @@ def main() -> None:
             return
         if subcommand == "add":
             result = macros.add()
-            console.print(Panel.fit(str(result), title="Macro Add"))
+            border = "green" if bool(result.get("success", False)) else "red"
+            console.print(Panel.fit(str(result), title="Macro Add", border_style=border))
             return
         if subcommand == "run" and len(args.macro_args) >= 2:
             name = args.macro_args[1]
             input_value = " ".join(args.macro_args[2:]) if len(args.macro_args) > 2 else ""
             result = macros.run(name, input_value)
-            console.print(Panel.fit(str(result), title="Macro Run"))
+            border = "green" if bool(result.get("success", False)) else "red"
+            console.print(Panel.fit(str(result), title="Macro Run", border_style=border))
             return
-        console.print(Panel.fit("Invalid --macro usage.", title="Macro"))
+        console.print(Panel.fit("Invalid --macro usage.", title="Macro", border_style="yellow"))
         return
 
     if args.command:
-        result = _execute_text_command(
+        _parsed, result = _execute_text_command(
             " ".join(args.command),
             session_context,
             session_memory_enabled,
@@ -371,7 +451,7 @@ def main() -> None:
             break
 
         try:
-            result = _execute_text_command(
+            _parsed, result = _execute_text_command(
                 text,
                 session_context,
                 session_memory_enabled,
@@ -380,6 +460,7 @@ def main() -> None:
             color = "green" if bool(result.get("success", False)) else "red"
             console.print(Panel.fit(str(result), title="ATLAS Result", border_style=color))
         except Exception as exc:
+            logging.error("REPL error: %s", exc)
             console.print(f"[red]Something went wrong: {exc}[/red]")
 
 
