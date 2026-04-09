@@ -46,9 +46,15 @@ def open_app(app: str) -> dict:
         if normalized in {"cmd", "command prompt"}:
             subprocess.Popen(["cmd"])
             return _ok("Opened Command Prompt.")
-        if normalized in {"vs code", "vscode", "code"}:
+        if normalized in {"vs code", "vscode", "code", "visual studio code"}:
             subprocess.Popen(["code"])
             return _ok("Opened VS Code.")
+        if normalized.startswith("vscode ") or normalized.startswith("vs code "):
+            path_arg = app.strip()[app.strip().lower().find(" ") + 1:].strip()
+            if not path_arg:
+                path_arg = "."
+            subprocess.Popen(["code", path_arg])
+            return _ok(f"Opened VS Code in {path_arg}.")
         if normalized in {"notepad++", "notepad plus plus"}:
             subprocess.Popen(["notepad++"])
             return _ok("Opened Notepad++.")

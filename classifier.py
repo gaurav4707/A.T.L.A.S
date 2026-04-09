@@ -28,6 +28,7 @@ def classify(text: str) -> dict[str, Any] | None:
     """Classify user text into a known command payload or return None."""
     try:
         normalized: str = re.sub(r"\s+", " ", text.strip())
+        normalized = normalized.rstrip(".,!?")
         if not normalized:
             return None
 
@@ -65,6 +66,16 @@ def classify(text: str) -> dict[str, Any] | None:
         if match:
             copied_text = match.group(1)
             return _result("clipboard_write", {"text": copied_text}, "Copying text to clipboard.", "low")
+
+        match = re.fullmatch(r"delete\s+(.+)", normalized, flags=re.IGNORECASE)
+        if match:
+            path = match.group(1).strip()
+            return _result("delete_file", {"path": path}, f"Deleting {path}.", "high")
+
+        match = re.fullmatch(r"remove\s+(.+)", normalized, flags=re.IGNORECASE)
+        if match:
+            path = match.group(1).strip()
+            return _result("delete_file", {"path": path}, f"Deleting {path}.", "high")
 
         match = re.fullmatch(r"close\s+(.+)", normalized, flags=re.IGNORECASE)
         if match:

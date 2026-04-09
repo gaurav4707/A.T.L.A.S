@@ -18,6 +18,26 @@ SAFE_FALLBACK: dict[str, Any] = {
 }
 
 _ALLOWED_RISK = {"low", "medium", "high", "critical"}
+VALID_ACTIONS = {
+    "open_app",
+    "close_app",
+    "web_search",
+    "open_url",
+    "set_volume",
+    "mute_volume",
+    "sleep_pc",
+    "shutdown_pc",
+    "restart_pc",
+    "create_file",
+    "rename_file",
+    "move_file",
+    "delete_file",
+    "clipboard_read",
+    "clipboard_write",
+    "get_time",
+    "run_macro",
+    "unknown",
+}
 
 # Grammar guidance for llama.cpp-compatible JSON shape constraints.
 _GBNF_GRAMMAR = """
@@ -47,6 +67,14 @@ def _build_prompt(user_prompt: str, session_context: list[Any]) -> str:
         "You are ATLAS command parser.\n"
         "Return ONLY valid JSON matching this exact object shape:\n"
         "{\"intent\": str, \"action\": str, \"params\": dict, \"response\": str, \"risk\": str}.\n"
+        "You must respond ONLY with valid JSON. The 'action' field must be EXACTLY one of these values - no other values are allowed:\n"
+        "open_app, close_app, web_search, open_url, set_volume, mute_volume,\n"
+        "sleep_pc, shutdown_pc, restart_pc, create_file, rename_file, move_file,\n"
+        "delete_file, clipboard_read, clipboard_write, get_time, run_macro, unknown.\n\n"
+        "If the user's intent does not match any of these, use action: 'unknown'.\n"
+        "For conversational messages or questions that are not commands, return action: 'unknown' and put your reply in the 'response' field.\n"
+        "NEVER invent new action names like 'delete', 'file_deletion', 'respond',\n"
+        "'sayHello', 'recall', or anything else not in this list.\n"
         "Risk must be one of: low, medium, high, critical.\n"
         "Do not include markdown or explanations.\n"
         "Use this llama.cpp GBNF grammar guidance:\n"
@@ -87,6 +115,12 @@ def _safe_json(raw: str) -> dict[str, Any] | None:
         parsed: Any = json.loads(raw)
     except json.JSONDecodeError:
         return None
+
+    if isinstance(parsed, dict):
+        action = parsed.get("action")
+        if action not in VALID_ACTIONS:
+            parsed["action"] = "unknown"
+
     return _validate_payload(parsed)
 
 

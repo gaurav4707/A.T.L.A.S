@@ -179,6 +179,14 @@ def _execute_text_command(
         params = {}
 
     execution_result = executor.execute(action, params)
+    
+    # For unknown actions, display the LLM response instead of the generic fallback
+    if action == "unknown" and parsed.get("response"):
+        execution_result = {
+            "success": True,
+            "message": str(parsed.get("response", "")),
+        }
+    
     latency_ms = int((time.perf_counter() - started) * 1000)
     history.log(
         raw=text,
@@ -206,14 +214,10 @@ def _dry_run_panel(text: str, session_context: deque[str], session_memory_enable
     params = parsed.get("params", {})
     if not isinstance(params, dict):
         params = {}
-    target = str(
-        params.get("path")
-        or params.get("src")
-        or params.get("dst")
-        or params.get("app")
-        or params.get("url")
-        or "-"
-    )
+    if "path" in params and str(params.get("path", "")).strip():
+        target = str(params.get("path", ""))
+    else:
+        target = "(no file specified)"
     risk = str(parsed.get("risk", "low")).lower()
     gate = "none"
     if risk == "medium":
@@ -378,6 +382,7 @@ def main() -> None:
 
     voice.set_command_handler(_voice_dispatch)
     if bool(config.get("voice_input", False)):
+        voice.warmup_model()
         voice.start_ptt_listener()
 
     banner = (

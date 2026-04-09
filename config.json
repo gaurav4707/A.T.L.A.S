@@ -1,10 +1,10 @@
 {
   "model": "mistral:7b",
-  "voice_input": false,
-  "voice_output": false,
-  "voice_key": "right_ctrl",
+  "voice_input": true,
+  "voice_output": true,
+  "voice_key": "f8",
   "voice_speed": 1.0,
-  "session_memory": false,
+  "session_memory": true,
   "session_memory_turns": 8,
   "allowed_paths": [
     "C:/Users/gkv47"
