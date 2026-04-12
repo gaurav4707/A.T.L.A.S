@@ -8,7 +8,7 @@
   "voice_key": "f8",
   "voice_speed": 1.0,
   "wake_word_enabled": true,
-  "wake_word_threshold": 0.35,
+  "wake_word_threshold": 0.2,
   "wake_word_model": "hey_atlas",
   "vad_silence_ms": 1500,
   "killswitch_hotkey": "ctrl+shift+k",

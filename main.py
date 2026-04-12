@@ -121,7 +121,14 @@ atlas = "main:main"
 
 
 def _start_api_server() -> None:
-    """Start FastAPI on localhost:8000 in a daemon thread and wait until ready."""
+    """Start FastAPI on localhost:8000 unless an existing API is already reachable."""
+    try:
+        response = requests.get("http://localhost:8000/status", timeout=0.5)
+        if response.status_code in {200, 401}:
+            return
+    except requests.RequestException:
+        pass
+
     thread = threading.Thread(
         target=uvicorn.run,
         args=(app,),
@@ -265,11 +272,18 @@ def _show_status(config: dict[str, Any]) -> int:
         console.print(Panel.fit(f"Status request failed: {exc}", title="Status"))
         return 1
 
+    if wake_word.is_listening():
+        voice_mode = "Wake word active (say 'hey atlas')"
+    elif settings.get("voice_input"):
+        hotkey = str(settings.get("voice_key") or "right_ctrl")
+        voice_mode = f"Push-to-talk ({hotkey})"
+    else:
+        voice_mode = "Disabled"
+
     body = (
         f"Model: {payload.get('model')}\n"
-        f"Voice Input: {payload.get('voice_input')}\n"
+        f"Voice Input: {voice_mode}\n"
         f"Voice Output: {payload.get('voice_output')}\n"
-        f"{payload.get('voice_mode', 'Push-to-talk mode')}\n"
         f"PIN Set: {payload.get('pin_set')}\n"
         f"Session Memory: {payload.get('session_memory')}\n"
         f"Uptime (s): {payload.get('uptime_s')}"
@@ -292,6 +306,9 @@ def _show_help_panel() -> None:
     help_table.add_row("atlas --macro list", "List macros")
     help_table.add_row("atlas --macro run NAME", "Run macro")
     help_table.add_row("atlas --macro run NAME X", "Run macro with input")
+    help_table.add_row("atlas --chain list", "Alias of macro list")
+    help_table.add_row("atlas --chain run NAME", "Alias of macro run")
+    help_table.add_row("atlas --chain run NAME X", "Alias with input")
     help_table.add_row("atlas --macro add", "Open macros.json")
     help_table.add_row("atlas --status", "Show status panel")
     help_table.add_row("atlas --setup", "PIN wizard + Ollama check")
@@ -307,6 +324,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--history", dest="history_args", nargs="*")
     parser.add_argument("--rerun", dest="rerun_id", type=int)
     parser.add_argument("--macro", dest="macro_args", nargs="+")
+    parser.add_argument("--chain", dest="chain_args", nargs="+")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--setup", action="store_true")
     parser.add_argument("--install-cli", action="store_true")
@@ -360,22 +378,18 @@ def main() -> None:
         except Exception as exc:
             logging.error("Voice dispatch failed: %s", exc)
 
-    voice.set_command_handler(_voice_dispatch)
-    if bool(config.get("voice_input", False)):
-        voice.warmup_model()
-        if bool(config.get("wake_word_enabled", False)):
-            started = wake_word.start_wake_word_listener()
-            if started:
-                phrase = str(config.get("wake_word_model") or "hey_jarvis").replace("_", " ")
-                print(f"[voice] Active mode: wake word ('{phrase}')", flush=True)
-            else:
-                key = str(config.get("voice_key") or "right_ctrl")
-                print(f"[voice] Active mode: push-to-talk (hold {key})", flush=True)
-                voice.start_ptt_listener()
-        else:
-            key = str(config.get("voice_key") or "right_ctrl")
-            print(f"[voice] Active mode: push-to-talk (hold {key})", flush=True)
-            voice.start_ptt_listener()
+    # Voice input - mutually exclusive modes
+    _wake_enabled = bool(settings.get("wake_word_enabled")) and wake_word.is_available()
+
+    if _wake_enabled:
+        wake_word.start_wake_word_listener()
+        print("[voice] Active mode: wake word (say 'hey atlas')", flush=True)
+    elif settings.get("voice_input"):
+        key = str(settings.get("voice_key") or "right_ctrl")
+        voice.start_ptt_listener()
+        print(f"[voice] Active mode: push-to-talk (hold {key})", flush=True)
+    else:
+        print("[dim]Voice input disabled - text mode only[/dim]", flush=True)
 
     banner = (
         f"ATLAS v1 | Model: {config.get('model')} | "
@@ -406,24 +420,30 @@ def main() -> None:
         console.print(Panel.fit(str(result), title="Rerun", border_style=border))
         return
 
-    if args.macro_args:
-        subcommand = args.macro_args[0].lower()
+    chain_or_macro_args = args.chain_args if args.chain_args else args.macro_args
+    chain_mode = bool(args.chain_args)
+    if chain_or_macro_args:
+        subcommand = chain_or_macro_args[0].lower()
         if subcommand == "list":
             _render_macro_list(macros.list())
             return
         if subcommand == "add":
             result = macros.add()
             border = "green" if bool(result.get("success", False)) else "red"
-            console.print(Panel.fit(str(result), title="Macro Add", border_style=border))
+            title = "Chain Add" if chain_mode else "Macro Add"
+            console.print(Panel.fit(str(result), title=title, border_style=border))
             return
-        if subcommand == "run" and len(args.macro_args) >= 2:
-            name = args.macro_args[1]
-            input_value = " ".join(args.macro_args[2:]) if len(args.macro_args) > 2 else ""
+        if subcommand == "run" and len(chain_or_macro_args) >= 2:
+            name = chain_or_macro_args[1]
+            input_value = " ".join(chain_or_macro_args[2:]) if len(chain_or_macro_args) > 2 else ""
             result = macros.run(name, input_value)
             border = "green" if bool(result.get("success", False)) else "red"
-            console.print(Panel.fit(str(result), title="Macro Run", border_style=border))
+            title = "Chain Run" if chain_mode else "Macro Run"
+            console.print(Panel.fit(str(result), title=title, border_style=border))
             return
-        console.print(Panel.fit("Invalid --macro usage.", title="Macro", border_style="yellow"))
+        usage_label = "--chain" if chain_mode else "--macro"
+        panel_title = "Chain" if chain_mode else "Macro"
+        console.print(Panel.fit(f"Invalid {usage_label} usage.", title=panel_title, border_style="yellow"))
         return
 
     if args.command:
