@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 import ollama
@@ -39,6 +40,8 @@ VALID_ACTIONS = {
     "unknown",
 }
 
+killswitch_event = threading.Event()
+
 # Grammar guidance for llama.cpp-compatible JSON shape constraints.
 _GBNF_GRAMMAR = """
 root ::= object
@@ -56,12 +59,17 @@ ws ::= [ \t\n\r]*
 """.strip()
 
 
-def _build_prompt(user_prompt: str, session_context: list[Any]) -> str:
-    """Build the full prompt with optional session context and JSON constraints."""
+def _build_prompt(user_prompt: str, context_str: Any) -> str:
+    """Build the full prompt with preassembled context and JSON constraints."""
     context_block = ""
-    if session_context:
-        context_lines = [f"- {item}" for item in session_context]
-        context_block = "Session context:\n" + "\n".join(context_lines) + "\n\n"
+    if isinstance(context_str, str):
+        cleaned = context_str.strip()
+        if cleaned:
+            context_block = cleaned + "\n\n"
+    elif context_str:
+        context_lines = [str(item) for item in context_str if str(item).strip()]
+        if context_lines:
+            context_block = "\n".join(context_lines).strip() + "\n\n"
 
     return (
         "You are ATLAS command parser.\n"
@@ -124,16 +132,21 @@ def _safe_json(raw: str) -> dict[str, Any] | None:
     return _validate_payload(parsed)
 
 
-def query(prompt: str, session_context: list[Any]) -> dict[str, Any]:
+def query(prompt: str, context_str: str) -> dict[str, Any]:
     """Query the configured Ollama model and return a safe structured payload."""
     model_name = str(settings.get("model") or "mistral:7b")
-    full_prompt = _build_prompt(prompt, session_context)
+    full_prompt = _build_prompt(prompt, context_str)
 
     attempts = 0
     while attempts < 2:
+        if killswitch_event.is_set():
+            return dict(SAFE_FALLBACK)
+
         attempts += 1
         try:
             response = ollama.generate(model=model_name, prompt=full_prompt)
+            if killswitch_event.is_set():
+                return dict(SAFE_FALLBACK)
             text = str(response.get("response", "")).strip()
             payload = _safe_json(text)
             if payload is not None:

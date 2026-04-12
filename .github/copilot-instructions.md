@@ -1,64 +1,64 @@
-# ATLAS — Copilot Instructions
+# ATLAS — Copilot Instructions (v2)
 
 ## Project
-ATLAS v1 (Almost Thinking Local AI System). A local, offline, CLI-first
-personal assistant. Python 3.11+, Windows 10/11.
 
-## What v1 Is
-Type or speak a command → ATLAS understands it → executes it on the PC → 
-speaks the result (optional). CLI only. No GUI. No always-on mic. 
-No persistent memory across sessions. No background threads.
+ATLAS v2 (Almost Thinking Local AI System). Builds on v1.
+Python 3.11+, Windows 10/11, Node 20+, Rust (Tauri).
 
-## Hard Rules — Never Violate
+## v1 Still Works
+
+All 14 v1 modules are unchanged unless explicitly upgraded in the current phase.
+The 'atlas' CLI command works throughout all v2 phases.
+
+## What v2 Adds
+
+1. ChromaDB semantic memory (replaces Python list in main.py)
+2. Background context pruner (Mistral 7B thread → ChromaDB)
+3. FastAPI WebSocket streaming endpoint
+4. Porcupine wake word (replaces push-to-talk)
+5. Tauri + React HUD connecting to same FastAPI backend
+6. Task chains (extends macros — macros.json still loads)
+
+## What v2 Does NOT Add (deferred to v3)
+
+- LlamaIndex RAG knowledge base
+- VS Code extension
+- Per-app profiles
+- Coding assistant / CP coach / debug assistant
+- Sprint mode / automation recorder
+- Backup / export bundle
+- Screen awareness (LLaVA)
+- Plugin system
+
+## Hard Rules — Same as v1, Plus These
+
 1. No LLM text EVER reaches os.system() or subprocess directly.
-   All execution goes through executor.ACTION_MAP only.
 2. Every Action class implements execute() AND verify().
 3. Type hints on every Python function.
 4. Docstring on every file and class.
-5. async/await for all I/O (FastAPI endpoints, voice, file ops).
+5. async/await for all I/O.
 6. Run existing tests before writing new code.
 7. Commit after every working vertical slice.
+8. v1 CLI must still work after every single module change — test it.
+9. EXACTLY 3 memory systems: ChromaDB (facts+summaries), sliding window, pruner.
+   Never add a 4th store. Never write to a JSON history file.
+10. HUD connects to the SAME FastAPI backend as CLI — no separate backend.
+11. Chains go through executor.ACTION_MAP — same security pipeline, no shortcuts.
 
-## What v1 Does NOT Have (deferred — do not add)
-- No Tauri/React HUD
-- No Porcupine wake word or always-on microphone
-- No ChromaDB or any persistent memory store
-- No background threads of any kind
-- No WebSocket streaming
-- No task chains with rollback (macros.json only)
-- No VS Code extension, per-app profiles, or RAG knowledge base
+## v2 Module Changes vs v1
 
-## 14 Modules — Exact Filenames
-main.py, api/server.py, classifier.py, llm_engine.py,
-validator.py, security.py, executor.py, verifier.py,
-rollback.py, voice.py, pc_control.py, macros.py,
+UPGRADED: memory.py (NEW — replaces Python list in main.py)
+voice.py (wake_word.py added alongside, push-to-talk kept)
+api/server.py (add WebSocket endpoint, keep all REST endpoints)
+macros.py → chains.py (superset, macros.json still loads)
+NEW: context_pruner.py, wake_word.py, killswitch.py
+NEW: hud/ (Tauri + React project, separate from Python)
+NEW: api/ws_manager.py
+UNCHANGED: classifier.py, llm_engine.py, validator.py, security.py,
+executor.py, verifier.py, rollback.py, pc_control.py,
 history.py, settings.py
 
-## Tech Stack (12 entries only)
-Ollama + Mistral 7B, llama.cpp GBNF grammar,
-custom regex pre-classifier, FastAPI + Uvicorn (localhost:8000),
-rich (CLI formatting), SpeechRecognition + Whisper tiny, edge-tts,
-pywinauto + Playwright + subprocess, bcrypt,
-Python list (session memory), sqlite3, json stdlib
+## New Tech for v2
 
-## Security Model
-Three rings:
-  Ring 1 — validator.py: action whitelist + risk tier lookup + E-02 + E-05
-  Ring 2 — security.py: Low=pass, Medium=type yes, High=PIN, Critical=blocked
-  Ring 3 — executor.py: pre-approved function dispatch map, no raw shell
-
-## Macros (v1 only — not chains)
-macros.json: name → list of command strings.
-500ms gap between steps. Stop on first failure. No rollback.
-Each step goes through executor.execute() — same security pipeline.
-
-## CLI Commands
-atlas 'open chrome'        single command
-atlas                      REPL loop
-atlas --dry 'delete x'    preview without executing
-atlas --history            last 20 commands
-atlas --rerun 5            re-execute command #5
-atlas --macro list/run/add macro management
-atlas --status             show model, voice, PIN, uptime
-atlas --setup              first-run wizard
-atlas --install-cli        register atlas on PATH
+chromadb, sentence-transformers, openWakeWord (fully open-source, no API key), webrtcvad,
+Tauri (cargo), React + TypeScript, react-markdown, Prism.js

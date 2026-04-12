@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -15,10 +15,12 @@ from slowapi.util import get_remote_address
 import classifier
 import executor
 import history
+import memory
 import llm_engine
 import macros
 import settings
 import verifier
+from api.ws_manager import ws_manager
 
 START_TIME = time.time()
 
@@ -64,10 +66,13 @@ async def _enforce_token(request: Request) -> None:
 async def status(request: Request) -> dict[str, Any]:
     """Return runtime and configuration status metadata."""
     await _enforce_token(request)
+    wake_word_active = bool(settings.get("wake_word_enabled"))
+    voice_mode = "Wake Word: active" if wake_word_active else "Push-to-talk mode"
     return {
         "model": settings.get("model"),
         "voice_input": bool(settings.get("voice_input")),
         "voice_output": bool(settings.get("voice_output")),
+        "voice_mode": voice_mode,
         "pin_set": bool(settings.get("pin_hash")),
         "session_memory": bool(settings.get("session_memory")),
         "uptime_s": int(time.time() - START_TIME),
@@ -89,7 +94,7 @@ async def dry_run(
         body_data = {}
 
     final_text = text or str(body_data.get("text") or "")
-    result = classifier.classify(final_text) or llm_engine.query(final_text, [])
+    result = classifier.classify(final_text) or llm_engine.query(final_text, memory.get_context_for_llm(final_text))
     return result
 
 
@@ -99,33 +104,45 @@ async def command(request: Request, payload: CommandRequest) -> dict[str, Any]:
     """Parse and execute a command through the secure execution pipeline."""
     await _enforce_token(request)
 
-    started = time.perf_counter()
-    intent = classifier.classify(payload.text) or llm_engine.query(payload.text, [])
+    try:
+        await ws_manager.broadcast({"type": "user_message", "data": payload.text})
 
-    action = str(intent.get("action", ""))
-    params = intent.get("params", {})
-    if not isinstance(params, dict):
-        params = {}
+        started = time.perf_counter()
+        intent = classifier.classify(payload.text) or llm_engine.query(payload.text, memory.get_context_for_llm(payload.text))
 
-    execution_result = executor.execute(action, params)
-    verify_result = verifier.verify(action, params, execution_result)
+        action = str(intent.get("action", ""))
+        params = intent.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
 
-    latency_ms = int((time.perf_counter() - started) * 1000)
-    history.log(
-        raw=payload.text,
-        action=action,
-        params=params,
-        success=bool(execution_result.get("success", False)),
-        latency_ms=latency_ms,
-        risk=str(intent.get("risk", "")),
-    )
+        await ws_manager.broadcast({"type": "action", "data": action})
+        execution_result = executor.execute(action, params)
+        verify_result = verifier.verify(action, params, execution_result)
 
-    return {
-        "action": action,
-        "result": str(execution_result.get("message", "")),
-        "verified": verify_result.ok,
-        "latency_ms": latency_ms,
-    }
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        history.log(
+            raw=payload.text,
+            action=action,
+            params=params,
+            success=bool(execution_result.get("success", False)),
+            latency_ms=latency_ms,
+            risk=str(intent.get("risk", "")),
+        )
+
+        response_text = str(execution_result.get("message", ""))
+        memory.add_to_sliding("user", payload.text)
+        memory.add_to_sliding("assistant", response_text)
+        await ws_manager.broadcast({"type": "done", "data": response_text})
+
+        return {
+            "action": action,
+            "result": response_text,
+            "verified": verify_result.ok,
+            "latency_ms": latency_ms,
+        }
+    except Exception as exc:
+        await ws_manager.broadcast({"type": "error", "data": str(exc)})
+        raise
 
 
 @app.get("/history")
@@ -149,3 +166,14 @@ async def run_macro(request: Request, payload: MacroRunRequest) -> dict[str, Any
     """Run a named macro with optional input substitution value."""
     await _enforce_token(request)
     return macros.run(payload.name, payload.input)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket) -> None:
+    """Accept a WebSocket connection and keep it alive for broadcast events."""
+    await ws_manager.connect(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except Exception:
+        ws_manager.disconnect(ws)

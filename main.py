@@ -9,7 +9,6 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -21,35 +20,22 @@ from rich.panel import Panel
 from rich.table import Table
 
 from api.server import app
+import context_pruner
 import classifier
 import executor
+import memory
 import history
+import killswitch
 import llm_engine
 import macros
 import rollback
 import security
 import settings
 import voice
+import wake_word
 
 console = Console()
-NO_MEMORY_SYSTEM_PROMPT = "You have no memory of previous sessions. Treat each command as independent."
 logging.basicConfig(filename="error.log", level=logging.ERROR, format="%(asctime)s | %(message)s")
-
-
-def _update_session_context(
-    session_context: deque[str],
-    text: str,
-    assistant_text: str,
-    session_memory_turns: int,
-) -> None:
-    """Append exchange and trim to configured session memory window."""
-    session_context.append(f"User: {text}")
-    session_context.append(f"ATLAS: {assistant_text}")
-
-    max_items = max(1, session_memory_turns) * 2
-    if len(session_context) > max_items:
-        while len(session_context) > max_items:
-            session_context.popleft()
 
 
 def _load_config_with_guard() -> dict[str, Any]:
@@ -154,24 +140,21 @@ def _start_api_server() -> None:
         time.sleep(0.5)
 
 
-def _classify_or_query(text: str, llm_context: list[str]) -> dict[str, Any]:
+def _classify_or_query(text: str, context_str: str) -> dict[str, Any]:
     """Resolve command intent via fast classifier then LLM fallback."""
     classified = classifier.classify(text)
     if classified is not None:
         return classified
-    return llm_engine.query(text, llm_context)
+    return llm_engine.query(text, context_str)
 
 
 def _execute_text_command(
     text: str,
-    session_context: deque[str],
-    session_memory_enabled: bool,
-    session_memory_turns: int,
+    context_str: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Execute one free-text command and log its outcome in history."""
-    llm_context = list(session_context) if session_memory_enabled else [NO_MEMORY_SYSTEM_PROMPT]
     started = time.perf_counter()
-    parsed = _classify_or_query(text, llm_context)
+    parsed = _classify_or_query(text, context_str)
 
     action = str(parsed.get("action", ""))
     params = parsed.get("params", {})
@@ -198,18 +181,17 @@ def _execute_text_command(
     )
 
     assistant_response = str(parsed.get("response", execution_result.get("message", "")))
-    if session_memory_enabled:
-        _update_session_context(session_context, text, assistant_response, session_memory_turns)
+    memory.add_to_sliding("user", text)
+    memory.add_to_sliding("assistant", assistant_response)
 
     voice.speak(assistant_response)
 
     return parsed, execution_result
 
 
-def _dry_run_panel(text: str, session_context: deque[str], session_memory_enabled: bool) -> None:
+def _dry_run_panel(text: str, context_str: str) -> None:
     """Print exact dry-run block without executing any action."""
-    llm_context = list(session_context) if session_memory_enabled else [NO_MEMORY_SYSTEM_PROMPT]
-    parsed = _classify_or_query(text, llm_context)
+    parsed = _classify_or_query(text, context_str)
     action = str(parsed.get("action", "unknown"))
     params = parsed.get("params", {})
     if not isinstance(params, dict):
@@ -287,6 +269,7 @@ def _show_status(config: dict[str, Any]) -> int:
         f"Model: {payload.get('model')}\n"
         f"Voice Input: {payload.get('voice_input')}\n"
         f"Voice Output: {payload.get('voice_output')}\n"
+        f"{payload.get('voice_mode', 'Push-to-talk mode')}\n"
         f"PIN Set: {payload.get('pin_set')}\n"
         f"Session Memory: {payload.get('session_memory')}\n"
         f"Uptime (s): {payload.get('uptime_s')}"
@@ -357,23 +340,20 @@ def main() -> None:
     config = _load_config_with_guard()
     rollback.auto_purge()
     _check_ollama_ready()
+    memory.review_and_expire()
     if not str(config.get("pin_hash", "")).strip():
         security.setup_pin()
         config = settings.load()
     _start_api_server()
-
-    session_context: deque[str] = deque(maxlen=max(1, int(config.get("session_memory_turns", 8))) * 2)
-    session_memory_enabled = bool(config.get("session_memory", False))
-    session_memory_turns = int(config.get("session_memory_turns", 8))
+    killswitch.register_hotkey()
+    context_pruner.start_pruner()
 
     def _voice_dispatch(voice_text: str) -> None:
         """Dispatch transcribed voice text through the same execution pipeline."""
         try:
             _parsed, voice_result = _execute_text_command(
                 voice_text,
-                session_context,
-                session_memory_enabled,
-                session_memory_turns,
+                memory.get_context_for_llm(voice_text),
             )
             border = "green" if bool(voice_result.get("success", False)) else "red"
             console.print(Panel.fit(str(voice_result), title="ATLAS Voice", border_style=border))
@@ -383,12 +363,24 @@ def main() -> None:
     voice.set_command_handler(_voice_dispatch)
     if bool(config.get("voice_input", False)):
         voice.warmup_model()
-        voice.start_ptt_listener()
+        if bool(config.get("wake_word_enabled", False)):
+            started = wake_word.start_wake_word_listener()
+            if started:
+                phrase = str(config.get("wake_word_model") or "hey_jarvis").replace("_", " ")
+                print(f"[voice] Active mode: wake word ('{phrase}')", flush=True)
+            else:
+                key = str(config.get("voice_key") or "right_ctrl")
+                print(f"[voice] Active mode: push-to-talk (hold {key})", flush=True)
+                voice.start_ptt_listener()
+        else:
+            key = str(config.get("voice_key") or "right_ctrl")
+            print(f"[voice] Active mode: push-to-talk (hold {key})", flush=True)
+            voice.start_ptt_listener()
 
     banner = (
         f"ATLAS v1 | Model: {config.get('model')} | "
         f"Voice: {'on' if bool(config.get('voice_input') or config.get('voice_output')) else 'off'} | "
-        f"Memory: {'on' if bool(config.get('session_memory')) else 'off'} | --help for commands"
+        f"Memory: on | --help for commands"
     )
     console.print(Panel.fit(banner, border_style="blue"))
     _print_model_hint(config)
@@ -397,7 +389,8 @@ def main() -> None:
         sys.exit(_show_status(config))
 
     if args.dry_command:
-        _dry_run_panel(" ".join(args.dry_command), session_context, session_memory_enabled)
+        dry_text = " ".join(args.dry_command)
+        _dry_run_panel(dry_text, memory.get_context_for_llm(dry_text))
         return
 
     if args.history_args is not None:
@@ -434,11 +427,10 @@ def main() -> None:
         return
 
     if args.command:
+        command_text = " ".join(args.command)
         _parsed, result = _execute_text_command(
-            " ".join(args.command),
-            session_context,
-            session_memory_enabled,
-            session_memory_turns,
+            command_text,
+            memory.get_context_for_llm(command_text),
         )
         color = "green" if bool(result.get("success", False)) else "red"
         console.print(Panel.fit(str(result), title="ATLAS Result", border_style=color))
@@ -456,11 +448,10 @@ def main() -> None:
             break
 
         try:
+            context_text = memory.get_context_for_llm(text)
             _parsed, result = _execute_text_command(
                 text,
-                session_context,
-                session_memory_enabled,
-                session_memory_turns,
+                context_text,
             )
             color = "green" if bool(result.get("success", False)) else "red"
             console.print(Panel.fit(str(result), title="ATLAS Result", border_style=color))

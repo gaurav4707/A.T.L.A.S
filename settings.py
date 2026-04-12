@@ -13,10 +13,19 @@ _CACHE: dict[str, Any] | None = None
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": "mistral:7b",
+    "chroma_path": ".atlas_chroma",
+    "memory_confidence_threshold": 0.75,
+    "memory_expiry_days": 30,
     "voice_input": False,
     "voice_output": False,
     "voice_key": "right_ctrl",
     "voice_speed": 1.0,
+    "wake_word_enabled": False,
+    "wake_word_threshold": 0.35,
+    "wake_word_model": "hey_atlas",
+    "vad_silence_ms": 1500,
+    "killswitch_hotkey": "ctrl+shift+k",
+    "killswitch_word": "stop",
     "session_memory": False,
     "session_memory_turns": 8,
     "allowed_paths": [str(Path.home()).replace("\\", "/")],
@@ -44,6 +53,18 @@ def _normalize(config: dict[str, Any]) -> dict[str, Any]:
 
     if not isinstance(normalized.get("session_memory_turns"), int):
         normalized["session_memory_turns"] = int(DEFAULT_CONFIG["session_memory_turns"])
+
+    try:
+        normalized["memory_confidence_threshold"] = float(normalized.get("memory_confidence_threshold", 0.75))
+    except (TypeError, ValueError):
+        normalized["memory_confidence_threshold"] = 0.75
+
+    try:
+        normalized["memory_expiry_days"] = int(normalized.get("memory_expiry_days", 30))
+    except (TypeError, ValueError):
+        normalized["memory_expiry_days"] = 30
+
+    normalized["chroma_path"] = str(normalized.get("chroma_path", ".atlas_chroma"))
 
     if normalized["session_memory_turns"] < 1:
         normalized["session_memory_turns"] = 1

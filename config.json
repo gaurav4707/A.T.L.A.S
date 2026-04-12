@@ -1,9 +1,18 @@
 {
   "model": "mistral:7b",
+  "chroma_path": ".atlas_chroma",
+  "memory_confidence_threshold": 0.75,
+  "memory_expiry_days": 30,
   "voice_input": true,
   "voice_output": true,
   "voice_key": "f8",
   "voice_speed": 1.0,
+  "wake_word_enabled": true,
+  "wake_word_threshold": 0.35,
+  "wake_word_model": "hey_atlas",
+  "vad_silence_ms": 1500,
+  "killswitch_hotkey": "ctrl+shift+k",
+  "killswitch_word": "stop",
   "session_memory": true,
   "session_memory_turns": 8,
   "allowed_paths": [

@@ -51,6 +51,16 @@ _STOP_TTS_EVENT = Event()
 _VAD_WARNING_PRINTED = False
 
 
+def _set_killswitch_tts_process(process: subprocess.Popen[Any] | None) -> None:
+    """Share current TTS process with killswitch module when available."""
+    try:
+        import killswitch
+
+        killswitch._current_tts_process = process
+    except Exception:
+        pass
+
+
 def _resolve_ffplay_path() -> str | None:
     """Resolve ffplay executable path from PATH or common Windows install locations."""
     on_path = shutil.which("ffplay")
@@ -158,6 +168,7 @@ def stop_speaking() -> None:
         except Exception:
             pass
     _CURRENT_TTS_PROCESS = None
+    _set_killswitch_tts_process(None)
 
     try:
         import pygame
@@ -167,6 +178,60 @@ def stop_speaking() -> None:
             pygame.mixer.quit()
     except Exception:
         pass
+
+
+def transcribe_audio(audio_bytes: bytes) -> str:
+    """Transcribe raw 16kHz mono int16 PCM bytes produced by wake-word capture."""
+    if not audio_bytes:
+        return ""
+
+    try:
+        import numpy as np
+
+        audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+        return transcribe_from_array(audio_int16)
+    except Exception as exc:
+        logging.error("Wake-word transcription failed: %s", exc)
+        return ""
+
+
+def transcribe_from_array(audio_int16) -> str:
+    """Transcribe a 16kHz mono int16 numpy-like array."""
+    try:
+        import numpy as np
+
+        if not isinstance(audio_int16, np.ndarray):
+            audio_int16 = np.asarray(audio_int16, dtype=np.int16)
+
+        if len(audio_int16) == 0:
+            return ""
+
+        speech_int16, _total_frames, _speech_frames = _strip_silence_with_vad(audio_int16, _SAMPLE_RATE)
+        if len(speech_int16) == 0:
+            return ""
+
+        audio_np = speech_int16.astype(np.float32) / 32768.0
+        peak = float(np.max(np.abs(audio_np))) if len(audio_np) else 0.0
+        if 0.0 < peak < 0.60:
+            gain = min(MAX_AUTO_GAIN, 0.60 / peak)
+            audio_np = np.clip(audio_np * gain, -1.0, 1.0)
+
+        model = _load_whisper_model()
+        transcribed = model.transcribe(
+            audio_np,
+            language="en",
+            prompt="Open app, search, volume, delete file, what time",
+            fp16=False,
+            temperature=0.0,
+            condition_on_previous_text=False,
+        )
+        text = _normalize_transcribed_text(str(transcribed.get("text", "")))
+        if _is_transcription_noise(text):
+            return ""
+        return text
+    except Exception as exc:
+        logging.error("Array transcription failed: %s", exc)
+        return ""
 
 
 def _on_escape(_: keyboard.KeyboardEvent) -> None:
@@ -409,7 +474,7 @@ def start_ptt_listener() -> None:
         keyboard.on_release_key(voice_key, _on_key_release)
         keyboard.on_press_key("esc", _on_escape)
         _PTT_HOOKED = True
-        print(f"[voice] PTT listener armed on key: {voice_key}", flush=True)
+        print(f"[voice] Push-to-talk - hold {voice_key}", flush=True)
     except Exception as exc:
         logging.error("PTT listener setup failed for key '%s': %s", voice_key, exc)
 
@@ -433,6 +498,7 @@ async def _speak_with_ffplay(text: str, voice_name: str, rate: str) -> bool:
             stderr=subprocess.DEVNULL,
         )
         _CURRENT_TTS_PROCESS = process
+        _set_killswitch_tts_process(process)
 
         async for chunk in communicate.stream():
             if _STOP_TTS_EVENT.is_set() or process.poll() is not None:
@@ -459,6 +525,7 @@ async def _speak_with_ffplay(text: str, voice_name: str, rate: str) -> bool:
             except Exception:
                 pass
         _CURRENT_TTS_PROCESS = None
+        _set_killswitch_tts_process(None)
 
 
 async def _speak_with_pygame(text: str, voice_name: str, rate: str) -> bool:
@@ -534,6 +601,7 @@ async def _speak_with_windows_media_player(text: str, voice_name: str, rate: str
             text=True,
         )
         _CURRENT_TTS_PROCESS = process
+        _set_killswitch_tts_process(process)
 
         while process.poll() is None:
             if _STOP_TTS_EVENT.is_set():
@@ -550,6 +618,7 @@ async def _speak_with_windows_media_player(text: str, voice_name: str, rate: str
         return False
     finally:
         _CURRENT_TTS_PROCESS = None
+        _set_killswitch_tts_process(None)
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
