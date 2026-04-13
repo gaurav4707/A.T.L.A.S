@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+import threading
 from typing import Any
 from uuid import uuid4
 
@@ -25,7 +26,7 @@ _summaries: Any | None = None
 _facts_fallback: list[dict[str, Any]] = []
 _summaries_fallback: list[dict[str, Any]] = []
 
-if _HAS_CHROMA:
+if _HAS_CHROMA and PersistentClient is not None:
     try:
         _client = PersistentClient(path=str(_CHROMA_PATH))
         _facts = _client.get_or_create_collection("facts")
@@ -63,6 +64,7 @@ def _load_encoder() -> Any:
 
 
 _encoder: Any = None  # Lazy-loaded on first use
+_encoder_lock = threading.Lock()
 _window_turns = int(settings.get("session_memory_turns") or 8)
 sliding_window: deque[dict[str, str]] = deque(maxlen=max(1, _window_turns) * 2)
 
@@ -70,8 +72,11 @@ sliding_window: deque[dict[str, str]] = deque(maxlen=max(1, _window_turns) * 2)
 def _get_encoder() -> Any:
     """Get or initialize the encoder (lazy-loaded)."""
     global _encoder
-    if _encoder is None:
-        _encoder = _load_encoder()
+    if _encoder is not None:
+        return _encoder
+    with _encoder_lock:
+        if _encoder is None:
+            _encoder = _load_encoder()
     return _encoder
 
 def _embedding_for_text(text: str) -> list[float]:

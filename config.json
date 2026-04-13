@@ -26,5 +26,7 @@
   "trash_dir": ".atlas_trash",
   "trash_retention_days": 7,
   "log_file": "history.db",
-  "api_token": "7d74eabc-15c0-499a-8e6f-bf2ed55d67c0"
+  "api_token": "7d74eabc-15c0-499a-8e6f-bf2ed55d67c0",
+  "voice_input_device": 18,
+  "TRANSFORMERS_OFFLINE": "1"
 }

@@ -31,7 +31,21 @@ def transcribe_from_array(audio_np: np.ndarray) -> str:
 
     try:
         audio_float = audio_np.flatten().astype(np.float32) / 32768.0
-        result = model.transcribe(audio_float, language="en", fp16=False)
+        result = model.transcribe(
+            audio_float,
+            language="en",
+            prompt=(
+                "ATLAS command assistant. Commands include: open chrome, open notepad, "
+                "open VS Code, close app, search web, set volume, mute, what time is it, "
+                "delete file, shutdown, restart, sleep, copy text."
+            ),
+            fp16=False,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            word_timestamps=False,
+            no_speech_threshold=0.5,
+            logprob_threshold=-1.0,
+        )
         return str(result.get("text", "")).strip()
     except Exception as exc:
         print(f"[dim]Transcription error: {exc}[/dim]")
@@ -68,7 +82,9 @@ def _load_whisper_model() -> Any | None:
     try:
         import whisper
 
-        _whisper_model = whisper.load_model("tiny")
+        # "small" gives better accuracy than "base" for command recognition
+        # and is fast enough on CPU for PTT use (2-4s transcription)
+        _whisper_model = whisper.load_model("small")
         return _whisper_model
     except Exception as exc:
         _whisper_load_failed = True
@@ -100,6 +116,7 @@ def _dispatch(text: str) -> None:
 def _record_ptt(hotkey: str) -> np.ndarray | None:
     """Block until hotkey is held, record while held, return audio array."""
     global _ptt_active
+    import time as _time
 
     frames: list[np.ndarray] = []
     keyboard.wait(hotkey)
@@ -112,6 +129,12 @@ def _record_ptt(hotkey: str) -> np.ndarray | None:
         dtype="int16",
         blocksize=CHUNK,
     ) as stream:
+        # Pre-roll: give the sounddevice stream ~100ms to stabilize before audio capture
+        try:
+            _time.sleep(0.1)
+        except Exception:
+            pass
+
         while keyboard.is_pressed(hotkey) and not _ptt_stop_event.is_set():
             chunk, _ = stream.read(CHUNK)
             audio_np = chunk.reshape(-1).astype(np.int16, copy=False)
@@ -143,6 +166,20 @@ def _ptt_loop() -> None:
 
 def start_ptt_listener() -> None:
     """Start push-to-talk listener loop."""
+    import ctypes
+
+    is_admin = False
+    try:
+        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        pass
+    if not is_admin:
+        print(
+            "[yellow][voice] WARNING: Push-to-talk may not work without admin rights.[/yellow]\n"
+            "[dim]Right-click your terminal and choose 'Run as administrator' if PTT is silent.[/dim]",
+            flush=True,
+        )
+
     _ptt_stop_event.clear()
     thread = threading.Thread(target=_ptt_loop, daemon=True)
     thread.start()

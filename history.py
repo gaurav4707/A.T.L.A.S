@@ -11,6 +11,7 @@ from typing import Any
 import classifier
 import executor
 import llm_engine
+import memory
 import settings
 
 
@@ -141,7 +142,7 @@ def rerun(n: int) -> dict[str, Any]:
         return {"success": False, "message": f"History item {n} not found."}
 
     text = str(row["raw_command"])
-    result = classifier.classify(text) or llm_engine.query(text, [])
+    result = classifier.classify(text) or llm_engine.query(text, memory.get_context_for_llm(text))
 
     action = str(result.get("action", ""))
     params = result.get("params", {})

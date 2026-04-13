@@ -1,7 +1,9 @@
 """ATLAS Phase 4 CLI with startup polish, voice support, and session memory."""
 
 from __future__ import annotations
-
+import os
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import argparse
 import json
 import logging
@@ -170,10 +172,10 @@ def _execute_text_command(
 
     execution_result = executor.execute(action, params)
     
-    # For unknown actions, display the LLM response instead of the generic fallback
+    # For unknown actions, preserve conversational response but keep KPI/history unsuccessful.
     if action == "unknown" and parsed.get("response"):
         execution_result = {
-            "success": True,
+            "success": False,
             "message": str(parsed.get("response", "")),
         }
     

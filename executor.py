@@ -66,7 +66,7 @@ def _describe(action: str, params: dict[str, Any]) -> str:
 def execute(action: str, params: dict[str, Any]) -> dict[str, Any]:
     """Execute one action through the fixed ACTION_MAP and security pipeline."""
     if action == "unknown":
-        return {"success": True, "message": "I can help with that. Try rephrasing as a command."}
+        return {"success": False, "message": "I can help with that. Try rephrasing as a command."}
     if action not in ACTION_MAP:
         return {"success": False, "message": "Unknown action"}
 

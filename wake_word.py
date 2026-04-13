@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from collections import deque
 
 import numpy as np
 import sounddevice as sd
 
+import classifier
+import executor
+import llm_engine
+import memory
 import settings
-from voice import transcribe_from_array, _dispatch
+import voice
 
 SAMPLE_RATE = 16000
 CHUNK = 1280  # 80ms required by openWakeWord
@@ -19,6 +25,19 @@ _stop_event = threading.Event()
 _listener_thread: threading.Thread | None = None
 _watchdog_thread: threading.Thread | None = None
 _pre_roll: deque[np.ndarray] = deque(maxlen=PREROLL_CHUNKS)
+_WAKE_LOCK = threading.Lock()
+_CAPTURING = threading.Event()
+
+
+def _broadcast_event(payload: dict[str, str]) -> None:
+    """Best-effort websocket event broadcast for HUD state updates."""
+    try:
+        from api.ws_manager import ws_manager
+        import asyncio
+
+        asyncio.run(ws_manager.broadcast(payload))
+    except Exception:
+        pass
 
 
 def _resolve_wakeword_model_name() -> str:
@@ -50,89 +69,123 @@ def is_available() -> bool:
     return _available
 
 
-def _record_command(stream: sd.InputStream) -> np.ndarray | None:
-    """Read from existing stream until silence, including pre-roll."""
-    silence_ms = int(settings.get("vad_silence_ms") or 1500)
-    silence_chunks_needed = max(1, int(silence_ms / 80))
-    max_chunks = int(SAMPLE_RATE * 10 / CHUNK)
-
-    frames = list(_pre_roll)
-    consecutive_silence = 0
-
-    for _ in range(max_chunks):
-        try:
-            chunk, _ = stream.read(CHUNK)
-        except Exception:
-            break
-
-        audio_np = chunk.reshape(-1).astype(np.int16, copy=False)
-        frames.append(audio_np.copy())
-
-        energy = float(np.abs(audio_np).mean())
-        if energy < 200:
-            consecutive_silence += 1
-        else:
-            consecutive_silence = 0
-
-        if consecutive_silence >= silence_chunks_needed:
-            break
-
-    if len(frames) < 3:
-        return None
-    return np.concatenate(frames)
-
-
-def _on_wake_word(stream: sd.InputStream) -> None:
-    """Handle wake-word trigger using already-open stream."""
-    try:
-        from api.ws_manager import ws_manager
-        import asyncio
-
-        asyncio.run(ws_manager.broadcast({"type": "listening_start"}))
-    except Exception:
-        pass
-
-    print("\n[blue]ATLAS: Listening...[/blue]")
-
-    audio = _record_command(stream)
-    if audio is None:
-        return
-
-    text = transcribe_from_array(audio)
-    if not text:
-        return
-
-    print(f"[dim]Heard: {text}[/dim]")
-    _dispatch(text)
-
-
 def _listen_loop() -> None:
     """Main wake-word listener loop. Exceptions continue and never break loop."""
-    threshold = float(settings.get("wake_word_threshold") or 0.35)
     print(f"[green]Wake word active - say '{_wake_phrase()}'[/green]")
+    chunk_size = CHUNK
+    sample_rate = SAMPLE_RATE
+    silence_ms = int(settings.get("vad_silence_ms") or 1500)
+    max_silent_chunks = max(1, int((silence_ms / 1000.0) * sample_rate / chunk_size))
 
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        blocksize=CHUNK,
-    ) as stream:
-        while not _stop_event.is_set():
-            try:
-                chunk, _ = stream.read(CHUNK)
-                audio_np = chunk.reshape(-1).astype(np.int16, copy=False)
-                _pre_roll.append(audio_np.copy())
-
-                pred = _oww_model.predict(audio_np)
-                if any(float(score) > threshold for score in pred.values()):
+    while not _stop_event.is_set():
+        try:
+            with sd.InputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=chunk_size,
+            ) as stream:
+                while not _stop_event.is_set():
                     try:
-                        _oww_model.reset()
-                    except Exception:
-                        pass
-                    _on_wake_word(stream)
-            except Exception as exc:
-                print(f"[dim]Wake word loop warning: {exc}[/dim]")
-                continue
+                        frame, _ = stream.read(chunk_size)
+                        if _oww_model is None:
+                            continue
+
+                        frame_i16 = frame.reshape(-1).astype(np.int16, copy=False)
+                        _pre_roll.append(frame_i16.copy())
+                        audio_np = frame_i16.astype(np.float32) / 32768.0
+
+                        # Detection mode on shared stream.
+                        prediction = _oww_model.predict(audio_np)
+                        if not isinstance(prediction, dict):
+                            continue
+
+                        threshold = float(settings.get("wake_word_threshold") or 0.35)
+                        if not any(float(score) > threshold for score in prediction.values()):
+                            continue
+
+                        # Wake word detected: switch to capture mode on same stream.
+                        if not _WAKE_LOCK.acquire(blocking=False):
+                            continue
+
+                        _CAPTURING.set()
+                        try:
+                            print("\n[blue]ATLAS: Listening...[/blue]", flush=True)
+                            _broadcast_event({"type": "listening_start"})
+
+                            drain_chunks = int(0.2 * sample_rate / chunk_size)
+                            for _ in range(drain_chunks):
+                                if _stop_event.is_set():
+                                    break
+                                stream.read(chunk_size)
+
+                            audio_chunks: list[np.ndarray] = []
+                            speech_started = False
+                            silent_count = 0
+                            deadline = time.time() + 4.0
+
+                            while not _stop_event.is_set():
+                                cap_frame, _ = stream.read(chunk_size)
+                                cap_i16 = cap_frame.reshape(-1).astype(np.int16, copy=False)
+                                energy = int(np.max(np.abs(cap_i16))) if cap_i16.size else 0
+
+                                if not speech_started:
+                                    if energy > 800:
+                                        speech_started = True
+                                        audio_chunks.append(cap_i16.copy())
+                                    elif time.time() > deadline:
+                                        break
+                                else:
+                                    audio_chunks.append(cap_i16.copy())
+                                    if energy < 800:
+                                        silent_count += 1
+                                        if silent_count >= max_silent_chunks:
+                                            break
+                                    else:
+                                        silent_count = 0
+
+                            if not audio_chunks:
+                                continue
+
+                            audio_i16 = np.concatenate(audio_chunks)
+                            text = voice.transcribe_from_array(audio_i16)
+                            normalized = text.strip().lower()
+                            if not normalized:
+                                continue
+
+                            print(f"[dim]Heard: {normalized}[/dim]", flush=True)
+
+                            killswitch_word = str(settings.get("killswitch_word") or "stop").strip().lower()
+                            if normalized == killswitch_word:
+                                try:
+                                    import killswitch as ks
+
+                                    ks.fire()
+                                except Exception:
+                                    pass
+                                continue
+
+                            context_text = memory.get_context_for_llm(normalized)
+                            parsed = classifier.classify(normalized) or llm_engine.query(normalized, context_text)
+                            action = str(parsed.get("action", ""))
+                            params = parsed.get("params", {})
+                            if not isinstance(params, dict):
+                                params = {}
+                            execution = executor.execute(action, params)
+                            response = str(execution.get("message", "Done."))
+                            memory.add_to_sliding("user", normalized)
+                            memory.add_to_sliding("assistant", response)
+                            voice.speak(response)
+                        finally:
+                            _CAPTURING.clear()
+                            _WAKE_LOCK.release()
+                    except Exception as exc:
+                        logging.warning("Wake word frame error: %s", exc)
+                        continue
+        except Exception as exc:
+            logging.warning("Wake word loop warning: %s", exc)
+            time.sleep(0.5)
+            continue
 
 
 def _start_thread() -> None:

@@ -26,7 +26,6 @@ def compress_and_store() -> None:
         summary = str(response.get("response", "")).strip()
         if not summary:
             return
-        memory.store_fact(summary, confidence=0.9, source="session_pruner")
         memory.store_summary(summary, confidence=0.9, source="session_pruner")
     except Exception:
         pass
