@@ -229,8 +229,8 @@ No official Dockerfile is included yet. Local Python + Ollama runtime is the sup
 
 ## 📄 License
 
-License is currently not declared in the repository. Add a LICENSE file (for example MIT, Apache-2.0, or proprietary) before public distribution.
+License is currently not declared in the repository.
 
 <p align="center">
-  Made with ❤️ by the ATLAS contributors.
+  Made with ❤️ by me.
 </p>
