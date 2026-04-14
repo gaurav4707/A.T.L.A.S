@@ -380,16 +380,27 @@ def main() -> None:
         except Exception as exc:
             logging.error("Voice dispatch failed: %s", exc)
 
-    # Voice input - mutually exclusive modes
+    # Voice input - prefer wake word, but fall back to PTT if wake word cannot start.
     _wake_enabled = bool(settings.get("wake_word_enabled")) and wake_word.is_available()
+    _voice_enabled = bool(settings.get("voice_input"))
 
     if _wake_enabled:
-        wake_word.start_wake_word_listener()
-        print("[voice] Active mode: wake word (say 'hey atlas')", flush=True)
-    elif settings.get("voice_input"):
+        if wake_word.start_wake_word_listener():
+            print("[voice] Active mode: wake word (say 'hey atlas')", flush=True)
+        elif _voice_enabled:
+            key = str(settings.get("voice_key") or "right_ctrl")
+            if voice.start_ptt_listener():
+                print(f"[voice] Wake word unavailable; falling back to push-to-talk (hold {key})", flush=True)
+            else:
+                print("[yellow]Wake word and push-to-talk both failed to start.[/yellow]", flush=True)
+        else:
+            print("[yellow]Wake word unavailable and voice input is disabled.[/yellow]", flush=True)
+    elif _voice_enabled:
         key = str(settings.get("voice_key") or "right_ctrl")
-        voice.start_ptt_listener()
-        print(f"[voice] Active mode: push-to-talk (hold {key})", flush=True)
+        if voice.start_ptt_listener():
+            print(f"[voice] Active mode: push-to-talk (hold {key})", flush=True)
+        else:
+            print("[yellow]Push-to-talk failed to start.[/yellow]", flush=True)
     else:
         print("[dim]Voice input disabled - text mode only[/dim]", flush=True)
 

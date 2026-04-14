@@ -25,6 +25,8 @@ _ptt_stop_event = threading.Event()
 _ptt_recording = threading.Event()
 _ptt_frames: list = []
 _ptt_stream: sd.InputStream | None = None
+_ptt_press_listener: Any | None = None
+_ptt_release_listener: Any | None = None
 
 
 def transcribe_from_array(audio_np: np.ndarray) -> str:
@@ -130,40 +132,59 @@ def _on_ptt_release(_event: Any) -> None:
 
 def _ptt_capture_loop() -> None:
     device = settings.get("voice_input_device")
-    device_index = int(device) if device is not None else None
+    preferred_device_index = int(device) if device is not None else None
 
-    kwargs: dict = dict(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="int16",
-        blocksize=CHUNK,
-    )
-    if device_index is not None:
-        kwargs["device"] = device_index
+    while not _ptt_stop_event.is_set():
+        kwargs: dict = {
+            "samplerate": SAMPLE_RATE,
+            "channels": 1,
+            "dtype": "int16",
+            "blocksize": CHUNK,
+        }
+        if preferred_device_index is not None:
+            kwargs["device"] = preferred_device_index
 
-    with sd.InputStream(**kwargs) as stream:
-        was_recording = False
-        while not _ptt_stop_event.is_set():
-            frame, _ = stream.read(CHUNK)
-            if _ptt_recording.is_set():
-                was_recording = True
-                _ptt_frames.append(frame.reshape(-1).astype(np.int16, copy=False).copy())
-            elif was_recording:
+        try:
+            with sd.InputStream(**kwargs) as stream:
                 was_recording = False
-                if _ptt_frames:
-                    audio = np.concatenate(_ptt_frames)
-                    _ptt_frames.clear()
-                    if len(audio) >= int(SAMPLE_RATE * 0.3):
-                        text = transcribe_from_array(audio)
-                        normalized = text.strip()
-                        if normalized:
-                            print(f"[dim]Heard: {normalized}[/dim]", flush=True)
-                            _dispatch(normalized)
-                        else:
-                            print("[dim]No speech detected.[/dim]", flush=True)
+                while not _ptt_stop_event.is_set():
+                    frame, _ = stream.read(CHUNK)
+                    if _ptt_recording.is_set():
+                        was_recording = True
+                        _ptt_frames.append(frame.reshape(-1).astype(np.int16, copy=False).copy())
+                    elif was_recording:
+                        was_recording = False
+                        if _ptt_frames:
+                            audio = np.concatenate(_ptt_frames)
+                            _ptt_frames.clear()
+                            if len(audio) >= int(SAMPLE_RATE * 0.3):
+                                text = transcribe_from_array(audio)
+                                normalized = text.strip()
+                                if normalized:
+                                    print(f"[dim]Heard: {normalized}[/dim]", flush=True)
+                                    _dispatch(normalized)
+                                else:
+                                    print("[dim]No speech detected.[/dim]", flush=True)
+        except Exception as exc:
+            message = str(exc)
+
+            # First failure path: fallback from configured device to default device.
+            if preferred_device_index is not None:
+                print(
+                    f"[yellow]PTT input device {preferred_device_index} failed: {message}[/yellow]",
+                    flush=True,
+                )
+                print("[yellow]Retrying PTT with system default input device...[/yellow]", flush=True)
+                preferred_device_index = None
+                continue
+
+            print(f"[red]PTT disabled: {message}[/red]", flush=True)
+            print("[yellow]Tip: switch Windows input device or disable WDM-KS for this mic.[/yellow]", flush=True)
+            return
 
 
-def start_ptt_listener() -> None:
+def start_ptt_listener() -> bool:
+    global _ptt_press_listener, _ptt_release_listener
     import ctypes
 
     try:
@@ -176,20 +197,31 @@ def start_ptt_listener() -> None:
     hotkey = str(settings.get("voice_key") or "f8")
     _ptt_stop_event.clear()
 
-    keyboard.on_press_key(hotkey, _on_ptt_press)
-    keyboard.on_release_key(hotkey, _on_ptt_release)
+    try:
+        _ptt_press_listener = keyboard.on_press_key(hotkey, _on_ptt_press)
+        _ptt_release_listener = keyboard.on_release_key(hotkey, _on_ptt_release)
+    except Exception as exc:
+        print(f"[red]PTT failed to register hotkey '{hotkey}': {exc}[/red]", flush=True)
+        return False
 
     thread = threading.Thread(target=_ptt_capture_loop, daemon=True)
     thread.start()
     print(f"[green]Push-to-talk active - hold {hotkey} to speak[/green]", flush=True)
+    return True
 
 
 def stop_ptt_listener() -> None:
+    global _ptt_press_listener, _ptt_release_listener
     _ptt_stop_event.set()
     try:
-        keyboard.unhook_key(str(settings.get("voice_key") or "f8"))
+        if _ptt_press_listener is not None:
+            keyboard.remove_hotkey(_ptt_press_listener)
+        if _ptt_release_listener is not None:
+            keyboard.remove_hotkey(_ptt_release_listener)
     except Exception:
         pass
+    _ptt_press_listener = None
+    _ptt_release_listener = None
 
 
 def _tts_runner(cmd: list[str]) -> None:

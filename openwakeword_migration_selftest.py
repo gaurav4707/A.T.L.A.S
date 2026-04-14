@@ -92,8 +92,8 @@ try:
         print(f"  ✗ FAIL: Still has pvporcupine references")
         sys.exit(1)
     
-    if "_OWW_MODEL" not in code:
-        print(f"  ✗ FAIL: No _OWW_MODEL found")
+    if "_oww_model" not in code and "_OWW_MODEL" not in code:
+        print(f"  ✗ FAIL: No OpenWakeWord model state variable found")
         sys.exit(1)
     
     if "from openwakeword.model import Model" not in code:

@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from collections import deque
+from typing import Any
 
 import numpy as np
 import sounddevice as sd
@@ -27,6 +28,9 @@ _watchdog_thread: threading.Thread | None = None
 _pre_roll: deque[np.ndarray] = deque(maxlen=PREROLL_CHUNKS)
 _WAKE_LOCK = threading.Lock()
 _CAPTURING = threading.Event()
+_oww_model: Any | None = None
+_available: bool | None = None
+_active_backend_model: str = ""
 
 
 def _broadcast_event(payload: dict[str, str]) -> None:
@@ -53,20 +57,76 @@ def _wake_phrase() -> str:
     configured = str(settings.get("wake_word_model") or "hey_atlas").strip().lower()
     return configured.replace("_", " ")
 
-try:
-    from openwakeword.model import Model as OWWModel
 
-    _oww_model = OWWModel(wakeword_models=[_resolve_wakeword_model_name()], inference_framework="onnx")
-    _available = True
-except Exception as exc:
+def _candidate_backend_models() -> list[str]:
+    """Return ordered backend model candidates for resilient startup."""
+    preferred = _resolve_wakeword_model_name()
+    candidates = [preferred]
+    if preferred == "hey_jarvis":
+        # Some openWakeWord builds ship without hey_jarvis; try common built-ins.
+        candidates.extend(["hey_mycroft", "alexa", "computer"])
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped
+
+
+def _load_openwakeword_model() -> bool:
+    """Lazy-load OpenWakeWord model with fallbacks for missing packaged models."""
+    global _oww_model, _available, _active_backend_model
+
+    if _available is True and _oww_model is not None:
+        return True
+    if _available is False:
+        return False
+
+    try:
+        from openwakeword.model import Model as OWWModel
+    except Exception as exc:
+        _oww_model = None
+        _available = False
+        print(f"[yellow]openWakeWord import failed: {exc}[/yellow]")
+        return False
+
+    preferred = _resolve_wakeword_model_name()
+    last_error: Exception | None = None
+
+    for model_name in _candidate_backend_models():
+        try:
+            _oww_model = OWWModel(wakeword_models=[model_name], inference_framework="onnx")
+            _active_backend_model = model_name
+            _available = True
+            if model_name != preferred:
+                print(
+                    f"[yellow]Wake model '{preferred}' unavailable; using '{model_name}' instead.[/yellow]",
+                    flush=True,
+                )
+            return True
+        except Exception as exc:
+            last_error = exc
+
+    try:
+        _oww_model = OWWModel(inference_framework="onnx")
+        _active_backend_model = "auto"
+        _available = True
+        print("[yellow]Using auto-discovered openWakeWord model set.[/yellow]", flush=True)
+        return True
+    except Exception as exc:
+        last_error = exc
+
     _oww_model = None
     _available = False
-    print(f"[yellow]openWakeWord not available: {exc}[/yellow]")
+    print(f"[yellow]openWakeWord not available: {last_error}[/yellow]")
+    return False
 
 
 def is_available() -> bool:
     """Return whether wake-word backend is available."""
-    return _available
+    return _load_openwakeword_model()
 
 
 def _listen_loop() -> None:
@@ -78,16 +138,16 @@ def _listen_loop() -> None:
     device_index = int(device) if device is not None else None
 
     while not _stop_event.is_set():
-        try:
-            kwargs: dict = dict(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="int16",
-                blocksize=CHUNK,
-            )
-            if device_index is not None:
-                kwargs["device"] = device_index
+        kwargs: dict[str, Any] = {
+            "samplerate": SAMPLE_RATE,
+            "channels": 1,
+            "dtype": "int16",
+            "blocksize": CHUNK,
+        }
+        if device_index is not None:
+            kwargs["device"] = device_index
 
+        try:
             with sd.InputStream(**kwargs) as stream:
                 print(f"[green]Wake word active - say '{_wake_phrase()}'[/green]", flush=True)
                 while not _stop_event.is_set():
@@ -187,6 +247,18 @@ def _listen_loop() -> None:
                         continue
 
         except Exception as exc:
+            message = str(exc)
+
+            if device_index is not None:
+                logging.warning("Wake word input device %s failed: %s", device_index, message)
+                print(
+                    f"[yellow]Wake word input device {device_index} failed: {message}[/yellow]",
+                    flush=True,
+                )
+                print("[yellow]Retrying wake word with system default input device...[/yellow]", flush=True)
+                device_index = None
+                continue
+
             logging.warning("Wake word loop warning: %s", exc)
             time.sleep(1.0)
             continue
@@ -215,8 +287,8 @@ def start_wake_word_listener() -> bool:
     """Start wake-word listener and watchdog."""
     global _watchdog_thread
 
-    if not _available:
-        print("[yellow]openWakeWord not installed - wake word disabled[/yellow]")
+    if not _load_openwakeword_model():
+        print("[yellow]Wake word backend unavailable - wake word disabled[/yellow]")
         return False
 
     _stop_event.clear()

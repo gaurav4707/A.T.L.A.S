@@ -5,6 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "atlas"
 version = "0.1.0"
+dependencies = [
+	"psutil>=5.9",
+	"pyperclip>=1.8",
+]
 
 [project.scripts]
 atlas = "main:main"
