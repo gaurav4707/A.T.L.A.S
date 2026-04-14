@@ -1,6 +1,11 @@
 """Persistent semantic and sliding-window memory for ATLAS v2."""
 
-from __future__ import annotations
+import os
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
+import logging as _logging
+_logging.getLogger("sentence_transformers").setLevel(_logging.ERROR)
 
 from collections import deque
 from datetime import datetime
@@ -56,7 +61,13 @@ class _FallbackEncoder:
 def _load_encoder() -> Any:
     """Load and cache the embedding model once for the current process."""
     try:
-        # Lazy import to avoid loading torch until needed
+        import logging as _lg
+
+        _lg.getLogger("sentence_transformers").setLevel(_lg.ERROR)
+        _lg.getLogger("transformers").setLevel(_lg.ERROR)
+        _lg.getLogger("transformers.modeling_utils").setLevel(_lg.ERROR)
+        from transformers.utils import logging as _tlog
+        _tlog.set_verbosity_error()
         from sentence_transformers import SentenceTransformer
         return SentenceTransformer("all-MiniLM-L6-v2")
     except Exception:

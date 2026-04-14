@@ -70,41 +70,41 @@ def is_available() -> bool:
 
 
 def _listen_loop() -> None:
-    """Main wake-word listener loop. Exceptions continue and never break loop."""
-    print(f"[green]Wake word active - say '{_wake_phrase()}'[/green]")
-    chunk_size = CHUNK
-    sample_rate = SAMPLE_RATE
+    threshold = float(settings.get("wake_word_threshold") or 0.35)
     silence_ms = int(settings.get("vad_silence_ms") or 1500)
-    max_silent_chunks = max(1, int((silence_ms / 1000.0) * sample_rate / chunk_size))
+    max_silent = max(1, int((silence_ms / 1000.0) * SAMPLE_RATE / CHUNK))
+
+    device = settings.get("voice_input_device")
+    device_index = int(device) if device is not None else None
 
     while not _stop_event.is_set():
         try:
-            with sd.InputStream(
-                samplerate=sample_rate,
+            kwargs: dict = dict(
+                samplerate=SAMPLE_RATE,
                 channels=1,
                 dtype="int16",
-                blocksize=chunk_size,
-            ) as stream:
+                blocksize=CHUNK,
+            )
+            if device_index is not None:
+                kwargs["device"] = device_index
+
+            with sd.InputStream(**kwargs) as stream:
+                print(f"[green]Wake word active - say '{_wake_phrase()}'[/green]", flush=True)
                 while not _stop_event.is_set():
                     try:
-                        frame, _ = stream.read(chunk_size)
+                        frame, _ = stream.read(CHUNK)
+                        frame_i16 = frame.reshape(-1).astype(np.int16, copy=False)
+                        audio_f = frame_i16.astype(np.float32) / 32768.0
+
                         if _oww_model is None:
                             continue
 
-                        frame_i16 = frame.reshape(-1).astype(np.int16, copy=False)
-                        _pre_roll.append(frame_i16.copy())
-                        audio_np = frame_i16.astype(np.float32) / 32768.0
-
-                        # Detection mode on shared stream.
-                        prediction = _oww_model.predict(audio_np)
-                        if not isinstance(prediction, dict):
+                        pred = _oww_model.predict(audio_f)
+                        if not isinstance(pred, dict):
+                            continue
+                        if not any(float(s) > threshold for s in pred.values()):
                             continue
 
-                        threshold = float(settings.get("wake_word_threshold") or 0.35)
-                        if not any(float(score) > threshold for score in prediction.values()):
-                            continue
-
-                        # Wake word detected: switch to capture mode on same stream.
                         if not _WAKE_LOCK.acquire(blocking=False):
                             continue
 
@@ -113,78 +113,82 @@ def _listen_loop() -> None:
                             print("\n[blue]ATLAS: Listening...[/blue]", flush=True)
                             _broadcast_event({"type": "listening_start"})
 
-                            drain_chunks = int(0.2 * sample_rate / chunk_size)
-                            for _ in range(drain_chunks):
+                            # Drain 200ms buffer on same stream
+                            for _ in range(int(0.2 * SAMPLE_RATE / CHUNK)):
                                 if _stop_event.is_set():
                                     break
-                                stream.read(chunk_size)
+                                stream.read(CHUNK)
 
-                            audio_chunks: list[np.ndarray] = []
-                            speech_started = False
-                            silent_count = 0
+                            # Capture command on same stream
+                            chunks: list = []
+                            started = False
+                            silent = 0
                             deadline = time.time() + 4.0
 
                             while not _stop_event.is_set():
-                                cap_frame, _ = stream.read(chunk_size)
-                                cap_i16 = cap_frame.reshape(-1).astype(np.int16, copy=False)
-                                energy = int(np.max(np.abs(cap_i16))) if cap_i16.size else 0
+                                cf, _ = stream.read(CHUNK)
+                                ci = cf.reshape(-1).astype(np.int16, copy=False)
+                                energy = int(np.max(np.abs(ci))) if ci.size else 0
 
-                                if not speech_started:
+                                if not started:
                                     if energy > 800:
-                                        speech_started = True
-                                        audio_chunks.append(cap_i16.copy())
+                                        started = True
+                                        chunks.append(ci.copy())
                                     elif time.time() > deadline:
                                         break
                                 else:
-                                    audio_chunks.append(cap_i16.copy())
+                                    chunks.append(ci.copy())
                                     if energy < 800:
-                                        silent_count += 1
-                                        if silent_count >= max_silent_chunks:
+                                        silent += 1
+                                        if silent >= max_silent:
                                             break
                                     else:
-                                        silent_count = 0
+                                        silent = 0
 
-                            if not audio_chunks:
+                            if not chunks:
                                 continue
 
-                            audio_i16 = np.concatenate(audio_chunks)
+                            audio_i16 = np.concatenate(chunks)
                             text = voice.transcribe_from_array(audio_i16)
                             normalized = text.strip().lower()
                             if not normalized:
+                                print("[dim]No speech detected.[/dim]", flush=True)
                                 continue
 
                             print(f"[dim]Heard: {normalized}[/dim]", flush=True)
 
-                            killswitch_word = str(settings.get("killswitch_word") or "stop").strip().lower()
-                            if normalized == killswitch_word:
+                            ks = str(settings.get("killswitch_word") or "stop").lower()
+                            if normalized == ks:
                                 try:
-                                    import killswitch as ks
-
-                                    ks.fire()
+                                    import killswitch as _ks
+                                    _ks.fire()
                                 except Exception:
                                     pass
                                 continue
 
-                            context_text = memory.get_context_for_llm(normalized)
-                            parsed = classifier.classify(normalized) or llm_engine.query(normalized, context_text)
+                            ctx = memory.get_context_for_llm(normalized)
+                            parsed = classifier.classify(normalized) or llm_engine.query(normalized, ctx)
                             action = str(parsed.get("action", ""))
                             params = parsed.get("params", {})
                             if not isinstance(params, dict):
                                 params = {}
-                            execution = executor.execute(action, params)
-                            response = str(execution.get("message", "Done."))
+                            result = executor.execute(action, params)
+                            resp = str(result.get("message", "Done."))
                             memory.add_to_sliding("user", normalized)
-                            memory.add_to_sliding("assistant", response)
-                            voice.speak(response)
+                            memory.add_to_sliding("assistant", resp)
+                            voice.speak(resp)
+
                         finally:
                             _CAPTURING.clear()
                             _WAKE_LOCK.release()
+
                     except Exception as exc:
                         logging.warning("Wake word frame error: %s", exc)
                         continue
+
         except Exception as exc:
             logging.warning("Wake word loop warning: %s", exc)
-            time.sleep(0.5)
+            time.sleep(1.0)
             continue
 
 

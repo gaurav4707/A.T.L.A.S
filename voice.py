@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import subprocess
 import threading
+import tempfile
+import os
 from typing import Any
 
 import keyboard
@@ -19,8 +21,10 @@ _whisper_model: Any | None = None
 _whisper_load_failed = False
 
 _tts_process: subprocess.Popen[bytes] | None = None
-_ptt_active = False
 _ptt_stop_event = threading.Event()
+_ptt_recording = threading.Event()
+_ptt_frames: list = []
+_ptt_stream: sd.InputStream | None = None
 
 
 def transcribe_from_array(audio_np: np.ndarray) -> str:
@@ -113,81 +117,79 @@ def _dispatch(text: str) -> None:
         print(f"[red]Dispatch error: {exc}[/red]")
 
 
-def _record_ptt(hotkey: str) -> np.ndarray | None:
-    """Block until hotkey is held, record while held, return audio array."""
-    global _ptt_active
-    import time as _time
+def _on_ptt_press(_event: Any) -> None:
+    if not _ptt_recording.is_set():
+        _ptt_frames.clear()
+        _ptt_recording.set()
+        print("[blue]Recording...[/blue]", flush=True)
 
-    frames: list[np.ndarray] = []
-    keyboard.wait(hotkey)
-    _ptt_active = True
-    print("[blue]Recording - release key to stop[/blue]")
 
-    with sd.InputStream(
+def _on_ptt_release(_event: Any) -> None:
+    _ptt_recording.clear()
+
+
+def _ptt_capture_loop() -> None:
+    device = settings.get("voice_input_device")
+    device_index = int(device) if device is not None else None
+
+    kwargs: dict = dict(
         samplerate=SAMPLE_RATE,
         channels=1,
         dtype="int16",
         blocksize=CHUNK,
-    ) as stream:
-        # Pre-roll: give the sounddevice stream ~100ms to stabilize before audio capture
-        try:
-            _time.sleep(0.1)
-        except Exception:
-            pass
+    )
+    if device_index is not None:
+        kwargs["device"] = device_index
 
-        while keyboard.is_pressed(hotkey) and not _ptt_stop_event.is_set():
-            chunk, _ = stream.read(CHUNK)
-            audio_np = chunk.reshape(-1).astype(np.int16, copy=False)
-            frames.append(audio_np.copy())
-
-    _ptt_active = False
-    if not frames:
-        return None
-    return np.concatenate(frames)
-
-
-def _ptt_loop() -> None:
-    hotkey = str(settings.get("voice_key") or "right_ctrl")
-    print(f"[green]Push-to-talk active - hold {hotkey} to speak[/green]")
-
-    while not _ptt_stop_event.is_set():
-        try:
-            audio = _record_ptt(hotkey)
-            if audio is None or len(audio) < int(SAMPLE_RATE * 0.3):
-                continue
-            text = transcribe_from_array(audio)
-            if text:
-                print(f"[dim]Heard: {text}[/dim]")
-                _dispatch(text)
-        except Exception as exc:
-            print(f"[dim]PTT error (continuing): {exc}[/dim]")
-            continue
+    with sd.InputStream(**kwargs) as stream:
+        was_recording = False
+        while not _ptt_stop_event.is_set():
+            frame, _ = stream.read(CHUNK)
+            if _ptt_recording.is_set():
+                was_recording = True
+                _ptt_frames.append(frame.reshape(-1).astype(np.int16, copy=False).copy())
+            elif was_recording:
+                was_recording = False
+                if _ptt_frames:
+                    audio = np.concatenate(_ptt_frames)
+                    _ptt_frames.clear()
+                    if len(audio) >= int(SAMPLE_RATE * 0.3):
+                        text = transcribe_from_array(audio)
+                        normalized = text.strip()
+                        if normalized:
+                            print(f"[dim]Heard: {normalized}[/dim]", flush=True)
+                            _dispatch(normalized)
+                        else:
+                            print("[dim]No speech detected.[/dim]", flush=True)
 
 
 def start_ptt_listener() -> None:
-    """Start push-to-talk listener loop."""
     import ctypes
 
-    is_admin = False
     try:
         is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
-        pass
+        is_admin = False
     if not is_admin:
-        print(
-            "[yellow][voice] WARNING: Push-to-talk may not work without admin rights.[/yellow]\n"
-            "[dim]Right-click your terminal and choose 'Run as administrator' if PTT is silent.[/dim]",
-            flush=True,
-        )
+        print("[yellow]PTT WARNING: Run terminal as administrator.[/yellow]", flush=True)
 
+    hotkey = str(settings.get("voice_key") or "f8")
     _ptt_stop_event.clear()
-    thread = threading.Thread(target=_ptt_loop, daemon=True)
+
+    keyboard.on_press_key(hotkey, _on_ptt_press)
+    keyboard.on_release_key(hotkey, _on_ptt_release)
+
+    thread = threading.Thread(target=_ptt_capture_loop, daemon=True)
     thread.start()
+    print(f"[green]Push-to-talk active - hold {hotkey} to speak[/green]", flush=True)
 
 
 def stop_ptt_listener() -> None:
-    """Stop push-to-talk listener loop."""
     _ptt_stop_event.set()
+    try:
+        keyboard.unhook_key(str(settings.get("voice_key") or "f8"))
+    except Exception:
+        pass
 
 
 def _tts_runner(cmd: list[str]) -> None:
@@ -202,21 +204,52 @@ def _tts_runner(cmd: list[str]) -> None:
 
 
 def speak(text: str) -> None:
-    """Fire-and-forget TTS. Does not block the main thread."""
+    """Generate TTS to temp file and play with ffplay. Non-blocking."""
     if not settings.get("voice_output"):
         return
-
     clean = str(text or "").strip()
     if not clean:
         return
 
     stop_speaking()
 
-    speed = float(settings.get("voice_speed") or 1.0)
-    rate = f"+{int((speed - 1.0) * 100)}%"
-    cmd = ["edge-tts", f"--rate={rate}", "--text", clean, "--write-media", "-"]
-    thread = threading.Thread(target=_tts_runner, args=(cmd,), daemon=True)
-    thread.start()
+    def _run() -> None:
+        global _tts_process
+        tmp_path = None
+        try:
+            import tempfile
+            import os
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+
+            speed = float(settings.get("voice_speed") or 1.0)
+            rate = f"+{int((speed - 1.0) * 100)}%"
+
+            result = subprocess.run(
+                ["edge-tts", f"--rate={rate}", "--text", clean, "--write-media", tmp_path],
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                return
+
+            _tts_process = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", tmp_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _tts_process.wait()
+        except Exception as exc:
+            print(f"[dim]TTS error: {exc}[/dim]")
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def stop_speaking() -> None:
