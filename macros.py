@@ -12,6 +12,7 @@ from typing import Any
 import classifier
 import executor
 import llm_engine
+import memory  # FIX BUG 8: was missing — macros need memory context like every other caller
 
 _MACROS_PATH = Path(__file__).resolve().parent / "macros.json"
 _DEFAULT_MACROS: dict[str, Any] = {
@@ -64,7 +65,14 @@ def run(name: str, input_val: str = "") -> dict[str, Any]:
     step_results: builtins.list[dict[str, Any]] = []
     for index, item in enumerate(steps, start=1):
         step_text = str(item).replace("{input}", input_val)
-        parsed = classifier.classify(step_text) or llm_engine.query(step_text, [])
+
+        # FIX BUG 8: The original called llm_engine.query(step_text, [])
+        # with an empty list, completely bypassing memory context.  Every
+        # other caller in ATLAS (main.py, history.py, api/server.py) uses
+        # memory.get_context_for_llm() so macro steps were context-blind.
+        # Use memory context here too for consistent behaviour.
+        context_str = memory.get_context_for_llm(step_text)
+        parsed = classifier.classify(step_text) or llm_engine.query(step_text, context_str)
 
         action = str(parsed.get("action", ""))
         params = parsed.get("params", {})

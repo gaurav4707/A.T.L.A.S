@@ -86,10 +86,24 @@ def _normalize(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def save(config: dict[str, Any]) -> None:
-    """Persist configuration to disk as JSON."""
+    """Persist configuration to disk and invalidate the in-memory cache.
+
+    FIX BUG 7: The original save() wrote to disk but never cleared _CACHE.
+    Any subsequent settings.load() call in the same process returned the
+    stale pre-save values. This caused pin_hash to appear empty right after
+    security.setup_pin() set it, making /status report pin_set=False and
+    making every in-process settings.get('pin_hash') return '' until restart.
+
+    Fix: set _CACHE = None after every save so the next load() re-reads disk.
+    """
+    global _CACHE
+
     clean_config: dict[str, Any] = dict(config)
     clean_config.pop("needs_pin_setup", None)
     _CONFIG_PATH.write_text(json.dumps(clean_config, indent=2), encoding="utf-8")
+
+    # Invalidate cache so next load() reflects the just-written values.
+    _CACHE = None
 
 
 def load() -> dict[str, Any]:
@@ -101,8 +115,11 @@ def load() -> dict[str, Any]:
 
     if not _CONFIG_PATH.exists():
         initial_config: dict[str, Any] = _normalize({})
-        save(initial_config)
         _CACHE = initial_config
+        # Use write-through path that also clears cache (safe: _CACHE just set)
+        clean = dict(initial_config)
+        clean.pop("needs_pin_setup", None)
+        _CONFIG_PATH.write_text(json.dumps(clean, indent=2), encoding="utf-8")
         return dict(_CACHE)
 
     try:
@@ -112,8 +129,12 @@ def load() -> dict[str, Any]:
         parsed = {}
 
     normalized = _normalize(parsed)
+
     # Rewrite if defaults/normalization changed persisted values.
-    save(normalized)
+    clean = dict(normalized)
+    clean.pop("needs_pin_setup", None)
+    _CONFIG_PATH.write_text(json.dumps(clean, indent=2), encoding="utf-8")
+
     _CACHE = normalized
     return dict(_CACHE)
 

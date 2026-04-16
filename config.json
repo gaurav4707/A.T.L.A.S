@@ -5,7 +5,7 @@
   "memory_expiry_days": 30,
   "voice_input": true,
   "voice_output": true,
-  "voice_key": "f12",
+  "voice_key": "left ctrl",
   "voice_speed": 1.0,
   "wake_word_enabled": true,
   "wake_word_threshold": 0.2,

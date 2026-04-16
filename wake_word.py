@@ -53,7 +53,19 @@ def _resolve_wakeword_model_name() -> str:
 
 
 def _wake_phrase() -> str:
-    """Return user-facing wake phrase from settings."""
+    """Return the phrase the user should actually say.
+
+    FIX BUG 5: The original always returned the *configured* name
+    (e.g. 'hey atlas') even when the backend fell back to a completely
+    different model (e.g. 'alexa'). The user would say 'hey atlas' while
+    the model was listening for 'alexa' — wake word never triggered.
+
+    Now returns the real backend model phrase so the startup message is
+    truthful and actionable.
+    """
+    if _active_backend_model and _active_backend_model not in ("", "auto"):
+        # Show what the model actually responds to
+        return _active_backend_model.replace("_", " ")
     configured = str(settings.get("wake_word_model") or "hey_atlas").strip().lower()
     return configured.replace("_", " ")
 
@@ -105,6 +117,10 @@ def _load_openwakeword_model() -> bool:
                     f"[yellow]Wake model '{preferred}' unavailable; using '{model_name}' instead.[/yellow]",
                     flush=True,
                 )
+                print(
+                    f"[yellow]Say '{model_name.replace('_', ' ')}' to activate ATLAS.[/yellow]",
+                    flush=True,
+                )
             return True
         except Exception as exc:
             last_error = exc
@@ -137,6 +153,9 @@ def _listen_loop() -> None:
     device = settings.get("voice_input_device")
     device_index = int(device) if device is not None else None
 
+    # FIX BUG 6: Track highest score seen per session so user can tune threshold
+    _session_peak: float = 0.0
+
     while not _stop_event.is_set():
         kwargs: dict[str, Any] = {
             "samplerate": SAMPLE_RATE,
@@ -149,7 +168,11 @@ def _listen_loop() -> None:
 
         try:
             with sd.InputStream(**kwargs) as stream:
-                print(f"[green]Wake word active - say '{_wake_phrase()}'[/green]", flush=True)
+                print(
+                    f"[green]Wake word active — say '{_wake_phrase()}' "
+                    f"(threshold: {threshold:.2f})[/green]",
+                    flush=True,
+                )
                 while not _stop_event.is_set():
                     try:
                         frame, _ = stream.read(CHUNK)
@@ -162,9 +185,32 @@ def _listen_loop() -> None:
                         pred = _oww_model.predict(audio_f)
                         if not isinstance(pred, dict):
                             continue
+
+                        # FIX BUG 6: Log scores above a debug floor so the user
+                        # can see what the model is actually detecting, making
+                        # threshold tuning possible without guessing.
+                        for model_name, score in pred.items():
+                            score_f = float(score)
+                            if score_f > 0.05:
+                                logging.debug(
+                                    "OWW %s score=%.3f threshold=%.2f",
+                                    model_name, score_f, threshold,
+                                )
+                            if score_f > _session_peak:
+                                _session_peak = score_f
+                                # Print when a new peak is reached above 0.1 —
+                                # helps diagnose "model never triggers" issues.
+                                if score_f > 0.1:
+                                    print(
+                                        f"[dim]Wake peak: {score_f:.3f} "
+                                        f"(need >{threshold:.2f} to trigger)[/dim]",
+                                        flush=True,
+                                    )
+
                         if not any(float(s) > threshold for s in pred.values()):
                             continue
 
+                        # Wake word detected — enter capture mode
                         if not _WAKE_LOCK.acquire(blocking=False):
                             continue
 
@@ -173,13 +219,13 @@ def _listen_loop() -> None:
                             print("\n[blue]ATLAS: Listening...[/blue]", flush=True)
                             _broadcast_event({"type": "listening_start"})
 
-                            # Drain 200ms buffer on same stream
+                            # Drain 200ms of post-wakeword audio from buffer
                             for _ in range(int(0.2 * SAMPLE_RATE / CHUNK)):
                                 if _stop_event.is_set():
                                     break
                                 stream.read(CHUNK)
 
-                            # Capture command on same stream
+                            # Capture command on the SAME stream (no second open)
                             chunks: list = []
                             started = False
                             silent = 0
@@ -195,6 +241,7 @@ def _listen_loop() -> None:
                                         started = True
                                         chunks.append(ci.copy())
                                     elif time.time() > deadline:
+                                        print("[dim]No speech after wake — returning to detection.[/dim]", flush=True)
                                         break
                                 else:
                                     chunks.append(ci.copy())
@@ -279,7 +326,7 @@ def _watchdog() -> None:
         if _stop_event.is_set():
             break
         if _listener_thread is not None and not _listener_thread.is_alive():
-            print("[yellow]Wake word listener died - restarting[/yellow]")
+            print("[yellow]Wake word listener died — restarting[/yellow]")
             _start_thread()
 
 
@@ -288,7 +335,7 @@ def start_wake_word_listener() -> bool:
     global _watchdog_thread
 
     if not _load_openwakeword_model():
-        print("[yellow]Wake word backend unavailable - wake word disabled[/yellow]")
+        print("[yellow]Wake word backend unavailable — wake word disabled[/yellow]")
         return False
 
     _stop_event.clear()

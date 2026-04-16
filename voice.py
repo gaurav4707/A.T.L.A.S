@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import subprocess
-import threading
-import tempfile
+import logging
 import os
+import subprocess
+import tempfile
+import threading
+import time
 from typing import Any
 
 import keyboard
@@ -37,6 +39,12 @@ def transcribe_from_array(audio_np: np.ndarray) -> str:
 
     try:
         audio_float = audio_np.flatten().astype(np.float32) / 32768.0
+
+        # Guard: Whisper needs at least ~0.1s of audio; pad if too short
+        min_samples = int(SAMPLE_RATE * 0.5)
+        if len(audio_float) < min_samples:
+            audio_float = np.pad(audio_float, (0, min_samples - len(audio_float)))
+
         result = model.transcribe(
             audio_float,
             language="en",
@@ -49,8 +57,11 @@ def transcribe_from_array(audio_np: np.ndarray) -> str:
             temperature=0.0,
             condition_on_previous_text=False,
             word_timestamps=False,
-            no_speech_threshold=0.5,
-            logprob_threshold=-1.0,
+            # FIX: 0.6 is Whisper's own default — 0.5 was too aggressive
+            no_speech_threshold=0.6,
+            # FIX: -1.0 caused empty results on short/quiet commands;
+            # -2.0 is far more permissive while still blocking garbage
+            logprob_threshold=-2.0,
         )
         return str(result.get("text", "")).strip()
     except Exception as exc:
@@ -165,10 +176,11 @@ def _ptt_capture_loop() -> None:
                                     _dispatch(normalized)
                                 else:
                                     print("[dim]No speech detected.[/dim]", flush=True)
+
         except Exception as exc:
             message = str(exc)
 
-            # First failure path: fallback from configured device to default device.
+            # First failure: fallback from configured device to default device.
             if preferred_device_index is not None:
                 print(
                     f"[yellow]PTT input device {preferred_device_index} failed: {message}[/yellow]",
@@ -178,9 +190,18 @@ def _ptt_capture_loop() -> None:
                 preferred_device_index = None
                 continue
 
-            print(f"[red]PTT disabled: {message}[/red]", flush=True)
-            print("[yellow]Tip: switch Windows input device or disable WDM-KS for this mic.[/yellow]", flush=True)
-            return
+            # FIX BUG 3: The original code had `return` here which killed PTT
+            # permanently on any transient stream error (e.g. device briefly
+            # disappearing, WDM-KS hiccup, another app stealing the device).
+            # Retry with a short delay instead — PTT recovers automatically.
+            logging.warning("PTT stream error: %s", message)
+            print(
+                f"[yellow]PTT stream error — retrying in 2s: {message}[/yellow]",
+                flush=True,
+            )
+            print("[dim]Tip: if this repeats, switch Windows input device or run as administrator.[/dim]", flush=True)
+            time.sleep(2.0)
+            continue  # was: return — which exited the loop forever
 
 
 def start_ptt_listener() -> bool:
@@ -192,7 +213,7 @@ def start_ptt_listener() -> bool:
     except Exception:
         is_admin = False
     if not is_admin:
-        print("[yellow]PTT WARNING: Run terminal as administrator.[/yellow]", flush=True)
+        print(f"[yellow]PTT WARNING: Run terminal as administrator.[/yellow]", flush=True)
 
     hotkey = str(settings.get("voice_key") or "f8")
     _ptt_stop_event.clear()
@@ -206,7 +227,7 @@ def start_ptt_listener() -> bool:
 
     thread = threading.Thread(target=_ptt_capture_loop, daemon=True)
     thread.start()
-    print(f"[green]Push-to-talk active - hold {hotkey} to speak[/green]", flush=True)
+    print(f"[green]Push-to-talk active — hold {hotkey} to speak[/green]", flush=True)
     return True
 
 
@@ -214,10 +235,15 @@ def stop_ptt_listener() -> None:
     global _ptt_press_listener, _ptt_release_listener
     _ptt_stop_event.set()
     try:
+        # FIX BUG 2: keyboard.on_press_key() / on_release_key() return hook
+        # objects, NOT hotkey handles.  Removing them with remove_hotkey() is
+        # the wrong API — it silently does nothing, so the hooks stay live
+        # forever and keep firing after stop is called.
+        # Correct API: keyboard.unhook(hook_object)
         if _ptt_press_listener is not None:
-            keyboard.remove_hotkey(_ptt_press_listener)
+            keyboard.unhook(_ptt_press_listener)
         if _ptt_release_listener is not None:
-            keyboard.remove_hotkey(_ptt_release_listener)
+            keyboard.unhook(_ptt_release_listener)
     except Exception:
         pass
     _ptt_press_listener = None
@@ -249,9 +275,6 @@ def speak(text: str) -> None:
         global _tts_process
         tmp_path = None
         try:
-            import tempfile
-            import os
-
             tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
             tmp_path = tmp.name
             tmp.close()
@@ -264,6 +287,8 @@ def speak(text: str) -> None:
                 capture_output=True,
             )
             if result.returncode != 0:
+                err_msg = result.stderr.decode(errors="ignore")[:200].strip()
+                print(f"[dim]edge-tts failed (code {result.returncode}): {err_msg}[/dim]", flush=True)
                 return
 
             _tts_process = subprocess.Popen(
@@ -272,6 +297,14 @@ def speak(text: str) -> None:
                 stderr=subprocess.DEVNULL,
             )
             _tts_process.wait()
+        except FileNotFoundError as exc:
+            if "ffplay" in str(exc):
+                print(
+                    "[red]Voice output requires ffplay. Install ffmpeg and add its bin/ folder to PATH.[/red]",
+                    flush=True,
+                )
+            else:
+                print(f"[red]TTS error: {exc}[/red]", flush=True)
         except Exception as exc:
             print(f"[dim]TTS error: {exc}[/dim]")
         finally:
