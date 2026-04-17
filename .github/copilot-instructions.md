@@ -1,64 +1,59 @@
-# ATLAS — Copilot Instructions (v2)
+# ATLAS — Copilot Instructions
 
 ## Project
 
-ATLAS v2 (Almost Thinking Local AI System). Builds on v1.
-Python 3.11+, Windows 10/11, Node 20+, Rust (Tauri).
+ATLAS is a local-first command and voice assistant. Current work is on the v2 line: Python 3.11+, Windows 10/11, Node 20+, and Rust for the Tauri HUD.
 
-## v1 Still Works
+## Always-On Rules
 
-All 14 v1 modules are unchanged unless explicitly upgraded in the current phase.
-The 'atlas' CLI command works throughout all v2 phases.
+1. Keep the CLI working. The `atlas` entrypoint must remain valid, and `python main.py --status` should work when the launcher is unavailable.
+2. Never send LLM output directly to `os.system()` or `subprocess`.
+3. Keep execution on the fixed action pipeline: classifier or LLM fallback -> validator -> security -> executor.ACTION_MAP -> verifier -> rollback if needed.
+4. Preserve the three memory layers only: sliding window, ChromaDB facts/summaries, and the background pruner.
+5. Every Python function should stay typed, and new or changed files should keep module/class docstrings.
+6. Use async/await for I/O where the code already follows that pattern.
+7. Prefer small, testable changes. Run the relevant existing checks before and after edits.
+8. Do not create a second backend for the HUD. The Tauri/React client must use the same FastAPI service as the CLI.
+9. Chains and macros must stay on the same security path as normal commands.
 
-## What v2 Adds
+## How To Run It
 
-1. ChromaDB semantic memory (replaces Python list in main.py)
-2. Background context pruner (Mistral 7B thread → ChromaDB)
-3. FastAPI WebSocket streaming endpoint
-4. Porcupine wake word (replaces push-to-talk)
-5. Tauri + React HUD connecting to same FastAPI backend
-6. Task chains (extends macros — macros.json still loads)
+- Setup and health checks: `atlas --setup`, `atlas --status`
+- Single command: `atlas "<command>"`
+- Preview only: `atlas --dry "<command>"`
+- History: `atlas --history`, `atlas --history search <term>`, `atlas --rerun <id>`
+- Macros/chains: `atlas --macro list`, `atlas --macro run <name>`, `atlas --chain list`, `atlas --chain run <name>`
+- CLI installer: `atlas --install-cli`
+- If the launcher is not installed, use `.venv\Scripts\python.exe main.py --status` or `python main.py --status`
 
-## What v2 Does NOT Add (deferred to v3)
+## Tests To Prefer
 
-- LlamaIndex RAG knowledge base
-- VS Code extension
-- Per-app profiles
-- Coding assistant / CP coach / debug assistant
-- Sprint mode / automation recorder
-- Backup / export bundle
-- Screen awareness (LLaVA)
-- Plugin system
+- `python phase2_selftest.py`
+- `python openwakeword_migration_selftest.py`
+- `python test_voice_integration.py`
+- `python test_wake_tuning.py`
+- `python test_audio.py`
 
-## Hard Rules — Same as v1, Plus These
+## Code Boundaries
 
-1. No LLM text EVER reaches os.system() or subprocess directly.
-2. Every Action class implements execute() AND verify().
-3. Type hints on every Python function.
-4. Docstring on every file and class.
-5. async/await for all I/O.
-6. Run existing tests before writing new code.
-7. Commit after every working vertical slice.
-8. v1 CLI must still work after every single module change — test it.
-9. EXACTLY 3 memory systems: ChromaDB (facts+summaries), sliding window, pruner.
-   Never add a 4th store. Never write to a JSON history file.
-10. HUD connects to the SAME FastAPI backend as CLI — no separate backend.
-11. Chains go through executor.ACTION_MAP — same security pipeline, no shortcuts.
+- [Readme.md](../Readme.md) documents the feature set, setup, and usage.
+- [ATLAS_Bug_Report.md](../ATLAS_Bug_Report.md) captures the known voice and settings fixes that must stay active.
+- [OPENWAKEWORD_MIGRATION.md](../OPENWAKEWORD_MIGRATION.md) covers wake-word migration details.
+- [main.py](../main.py) is the orchestrator and CLI entrypoint.
+- [api/server.py](../api/server.py) and [api/ws_manager.py](../api/ws_manager.py) own the FastAPI REST and WebSocket layer.
+- [memory.py](../memory.py) owns sliding context and semantic memory.
+- [context_pruner.py](../context_pruner.py) owns background compression into memory.
+- [voice.py](../voice.py) and [wake_word.py](../wake_word.py) own audio capture and wake-word behavior.
+- [executor.py](../executor.py), [validator.py](../validator.py), [security.py](../security.py), [verifier.py](../verifier.py), and [rollback.py](../rollback.py) form the security and execution pipeline.
 
-## v2 Module Changes vs v1
+## Known Pitfalls
 
-UPGRADED: memory.py (NEW — replaces Python list in main.py)
-voice.py (wake_word.py added alongside, push-to-talk kept)
-api/server.py (add WebSocket endpoint, keep all REST endpoints)
-macros.py → chains.py (superset, macros.json still loads)
-NEW: context_pruner.py, wake_word.py, killswitch.py
-NEW: hud/ (Tauri + React project, separate from Python)
-NEW: api/ws_manager.py
-UNCHANGED: classifier.py, llm_engine.py, validator.py, security.py,
-executor.py, verifier.py, rollback.py, pc_control.py,
-history.py, settings.py
+- `settings.get()` is key-only in this repo; use `settings.get(key) or default`.
+- `atlas` may point to the wrong Python install on this machine; prefer the workspace venv when validating changes.
+- ChromaDB collection reads return ids automatically; do not pass an `ids` include key.
+- The voice stack is expected to degrade gracefully when wake-word or audio dependencies are unavailable.
 
-## New Tech for v2
+## Notes For Future Work
 
-chromadb, sentence-transformers, openWakeWord (fully open-source, no API key), webrtcvad,
-Tauri (cargo), React + TypeScript, react-markdown, Prism.js
+- Keep phase-specific or bug-specific detail in linked docs instead of expanding this file.
+- If a new area needs different rules, add a targeted instruction file with `applyTo` instead of bloating the workspace-wide instructions.

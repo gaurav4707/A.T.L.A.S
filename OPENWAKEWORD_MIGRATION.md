@@ -141,10 +141,26 @@ Settings check: if not wake_word_enabled → print message, return
   ↓
 Load OpenWakeWord model (first run: ~1-2s to download + cache)
   ↓
-Spawn daemon thread: _listen_loop()
+Spawn daemon threads: _producer_loop() + _listen_loop()
   ↓
-[voice] Wake word active - listening for 'hey jarvis'
+[producer] One shared 16 kHz / 1280-sample stream captures continuously
+  ↓
+[producer] Routes frames into dedicated wake/PTT queues by state
+  ↓
+[_listen_loop()] Consumes wake queue for OWW, PTT queue while key is held
+  ↓
+[voice] Audio loop active - wake word + PTT
 ```
+
+## Audio Lifecycle
+
+- The capture stream is opened once at 16,000 Hz with 1-channel, 1280-sample chunks.
+- A dedicated producer thread owns the stream and routes chunks into two bounded queues: wake queue and PTT queue.
+- The consumer loop drains only the active queue based on `is_ptt_active` state.
+- On PTT activation, the wake queue and wake sliding buffer are flushed, wake inference is paused, and only PTT frames are consumed.
+- On PTT release, buffered PTT audio is transcribed once and wake processing is re-armed with clean context.
+- Wake-word capture and PTT transcription both continue to use the same chunk size and sample rate established by the migration.
+- Wake inference keeps temporal context with a sliding pre-roll buffer (overlapping frame history) before command capture.
 
 ---
 
@@ -187,7 +203,7 @@ Expected output:
    You should see:
 
    ```
-   [voice] Wake word active - listening for 'hey jarvis'
+   [voice] Audio loop active — wake word + PTT
    ```
 
 3. **Trigger the model**:

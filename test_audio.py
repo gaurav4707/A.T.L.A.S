@@ -68,25 +68,54 @@ except Exception as e:
 
 # Test 5: openWakeWord detection
 print("--- openWakeWord detection test ---")
-print("Say 'hey atlas' 3 times in the next 10 seconds...")
+try:
+    import wake_word
+    wake_word.is_available()
+    wake_phrase = wake_word._wake_phrase()
+except Exception:
+    wake_phrase = "hey atlas"
+
+print(f"Say '{wake_phrase}' 3 times in the next 10 seconds...")
 try:
     from openwakeword.model import Model
     oww = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
     detections = 0
+    thresholds = [0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.30, 0.35]
+    threshold_hits = {thr: 0 for thr in thresholds}
+    observed_scores: list[float] = []
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                         dtype='int16', blocksize=CHUNK) as stream:
         for i in range(int(SAMPLE_RATE * 10 / CHUNK)):
             chunk, _ = stream.read(CHUNK)
             audio_np = np.frombuffer(chunk, dtype=np.int16)
             pred = oww.predict(audio_np)
-            for name, score in pred.items():
-                if score > 0.1:
-                    print(f"  Score: {score:.3f} {'<-- DETECTED' if score > 0.35 else ''}")
-                if score > 0.35:
-                    detections += 1
+            best_score = 0.0
+            for _name, score in pred.items():
+                score_f = float(score)
+                if score_f > best_score:
+                    best_score = score_f
+            observed_scores.append(best_score)
+            if best_score > 0.1:
+                print(f"  Score: {best_score:.3f} {'<-- DETECTED' if best_score > 0.35 else ''}")
+            for thr in thresholds:
+                if best_score > thr:
+                    threshold_hits[thr] += 1
+            if best_score > 0.35:
+                detections += 1
+
     print(f"Total detections (threshold 0.35): {detections}")
+    if observed_scores:
+        scores_np = np.array(observed_scores, dtype=np.float32)
+        p95 = float(np.percentile(scores_np, 95))
+        suggested = max(0.08, min(0.45, p95 * 0.90))
+        summary = ", ".join(
+            f"{thr:.2f}:{threshold_hits[thr]}" for thr in thresholds
+        )
+        print(f"Threshold sweep hits: {summary}")
+        print(f"Suggested threshold from p95 ({p95:.3f}): {suggested:.2f}")
+
     if detections == 0:
-        print("WARNING: No detections. Say 'hey atlas' clearly.")
+        print(f"WARNING: No detections. Say '{wake_phrase}' clearly.")
     else:
         print("openWakeWord: OK")
 except Exception as e:

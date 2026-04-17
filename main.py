@@ -275,9 +275,14 @@ def _show_status(config: dict[str, Any]) -> int:
         return 1
 
     if wake_word.is_listening():
-        voice_mode = "Wake word active (say 'hey atlas')"
+        parts: list[str] = []
+        if bool(settings.get("wake_word_enabled")):
+            parts.append(f"wake word (say '{wake_word._wake_phrase()}')")
+        if bool(settings.get("voice_input")):
+            parts.append(f"PTT (hold '{settings.get('voice_key') or 'f8'}')")
+        voice_mode = f"Audio loop active ({' + '.join(parts)})" if parts else "Audio loop active"
     elif settings.get("voice_input"):
-        hotkey = str(settings.get("voice_key") or "right_ctrl")
+        hotkey = str(settings.get("voice_key") or "f8")
         voice_mode = f"Push-to-talk ({hotkey})"
     else:
         voice_mode = "Disabled"
@@ -380,29 +385,36 @@ def main() -> None:
         except Exception as exc:
             logging.error("Voice dispatch failed: %s", exc)
 
-    # Voice input - prefer wake word, but fall back to PTT if wake word cannot start.
-    _wake_enabled = bool(settings.get("wake_word_enabled")) and wake_word.is_available()
-    _voice_enabled = bool(settings.get("voice_input"))
+    # Unified audio loop: handles both wake word and PTT in one stream.
+    # Start it if either wake word or PTT voice input is enabled.
+    _wake_available = wake_word.is_available()
+    _wake_wanted = bool(settings.get("wake_word_enabled"))
+    _ptt_wanted = bool(settings.get("voice_input"))
 
-    if _wake_enabled:
-        if wake_word.start_wake_word_listener():
-            print("[voice] Active mode: wake word (say 'hey atlas')", flush=True)
-        elif _voice_enabled:
-            key = str(settings.get("voice_key") or "right_ctrl")
-            if voice.start_ptt_listener():
-                print(f"[voice] Wake word unavailable; falling back to push-to-talk (hold {key})", flush=True)
-            else:
-                print("[yellow]Wake word and push-to-talk both failed to start.[/yellow]", flush=True)
+    if _wake_wanted or _ptt_wanted:
+        if _wake_wanted and not _wake_available:
+            print(
+                "[yellow]Wake word model unavailable. PTT only (if voice_input: true in config).[/yellow]",
+                flush=True,
+            )
+        started = wake_word.start_wake_word_listener()
+        if started:
+            mode_parts = []
+            if _wake_wanted and _wake_available:
+                mode_parts.append(f"wake word ('{wake_word._wake_phrase()}')")
+            if _ptt_wanted:
+                mode_parts.append(f"PTT (hold '{settings.get('voice_key') or 'f8'}')")
+            print(
+                f"[green][voice] Active: {' + '.join(mode_parts)}[/green]",
+                flush=True,
+            )
         else:
-            print("[yellow]Wake word unavailable and voice input is disabled.[/yellow]", flush=True)
-    elif _voice_enabled:
-        key = str(settings.get("voice_key") or "right_ctrl")
-        if voice.start_ptt_listener():
-            print(f"[voice] Active mode: push-to-talk (hold {key})", flush=True)
-        else:
-            print("[yellow]Push-to-talk failed to start.[/yellow]", flush=True)
+            print(
+                "[red][voice] Audio loop failed to start. Check microphone and run as administrator.[/red]",
+                flush=True,
+            )
     else:
-        print("[dim]Voice input disabled - text mode only[/dim]", flush=True)
+        print("[dim]Voice input disabled — text mode only.[/dim]", flush=True)
 
     banner = (
         f"ATLAS v1 | Model: {config.get('model')} | "
