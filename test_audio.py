@@ -80,7 +80,8 @@ try:
     from openwakeword.model import Model
     oww = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
     detections = 0
-    thresholds = [0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.30, 0.35]
+    baseline_threshold = 0.50
+    thresholds = [0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.30, 0.35, 0.50]
     threshold_hits = {thr: 0 for thr in thresholds}
     observed_scores: list[float] = []
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
@@ -96,14 +97,14 @@ try:
                     best_score = score_f
             observed_scores.append(best_score)
             if best_score > 0.1:
-                print(f"  Score: {best_score:.3f} {'<-- DETECTED' if best_score > 0.35 else ''}")
+                print(f"  Score: {best_score:.3f} {'<-- DETECTED' if best_score > baseline_threshold else ''}")
             for thr in thresholds:
                 if best_score > thr:
                     threshold_hits[thr] += 1
-            if best_score > 0.35:
+            if best_score > baseline_threshold:
                 detections += 1
 
-    print(f"Total detections (threshold 0.35): {detections}")
+    print(f"Total detections (threshold {baseline_threshold:.2f}): {detections}")
     if observed_scores:
         scores_np = np.array(observed_scores, dtype=np.float32)
         p95 = float(np.percentile(scores_np, 95))

@@ -1,7 +1,7 @@
 """voice.py - Voice I/O handler for ATLAS v2."""
 
 from __future__ import annotations
-
+import keyboard
 import os
 import subprocess
 import tempfile
@@ -19,6 +19,11 @@ _whisper_model: Any | None = None
 _whisper_load_failed = False
 
 _tts_process: subprocess.Popen[bytes] | None = None
+_ptt_stop_event = threading.Event()
+_ptt_recording = threading.Event()
+_ptt_frames: list[bytes] = []
+_ptt_press_listener: Any | None = None
+_ptt_release_listener: Any | None = None
 
 
 def transcribe_from_array(audio_np: np.ndarray) -> str:
@@ -100,12 +105,60 @@ def _load_whisper_model() -> Any | None:
 
 
 def start_ptt_listener() -> bool:
-    """PTT is now handled inside wake_word._listen_loop(). This is a no-op stub."""
-    key = str(settings.get("voice_key") or "f8")
-    print(
-        f"[dim]PTT mode configured (key: '{key}'). Audio loop handles PTT alongside wake word.[/dim]",
-        flush=True,
-    )
+    """
+    Register PTT key hooks.
+
+    Starts the standalone _ptt_capture_loop ONLY when the wake word consumer
+    is NOT running (i.e. wake word is disabled).  When wake word is active,
+    the consumer already owns the mic and handles PTT via ptt_active.
+    """
+    import ctypes
+    global _ptt_press_listener, _ptt_release_listener
+
+    try:
+        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        is_admin = False
+    if not is_admin:
+        print("[yellow]PTT WARNING: Run terminal as administrator.[/yellow]", flush=True)
+
+    hotkey = str(settings.get("voice_key") or "f8")
+
+    _ptt_stop_event.clear()
+
+    try:
+        _ptt_press_listener = keyboard.on_press_key(hotkey, _on_ptt_press)
+        _ptt_release_listener = keyboard.on_release_key(hotkey, _on_ptt_release)
+    except Exception as exc:
+        print(f"[red]PTT failed to register hotkey '{hotkey}': {exc}[/red]", flush=True)
+        return False
+
+    # Check whether the wake word consumer is already running
+    wake_running = False
+    try:
+        import wake_word as _ww
+        wake_running = _ww.is_listening()
+    except Exception:
+        pass
+
+    if wake_running:
+        # Consumer owns the mic — PTT is just a key signal
+        print(
+            f"[green]Push-to-talk active — hold {hotkey} to speak "
+            f"(routed through wake word consumer)[/green]",
+            flush=True,
+        )
+    else:
+        # Wake word not running — start the standalone capture loop
+        from voice import _ptt_capture_loop
+        thread = threading.Thread(target=_ptt_capture_loop, daemon=True)
+        thread.start()
+        print(
+            f"[green]Push-to-talk active — hold {hotkey} to speak "
+            f"(standalone stream mode)[/green]",
+            flush=True,
+        )
+
     return True
 
 
@@ -196,3 +249,53 @@ def stop_speaking() -> None:
 def set_command_handler(_handler: Any) -> None:
     """Compatibility no-op. Dispatch is internal to this module."""
     return
+
+
+def _ptt_capture_loop() -> None:
+    """Fallback PTT capture loop placeholder when wake word is disabled."""
+    while not _ptt_stop_event.is_set():
+        _ptt_stop_event.wait(0.1)
+
+
+def _on_ptt_press(_event: Any) -> None:
+    """
+    PTT key pressed.
+
+    If the wake word consumer is running, delegate to it — no stream needed.
+    Otherwise fall back to the existing standalone PTT path.
+    """
+    try:
+        import wake_word as _ww
+        if _ww.is_listening():
+            _ww.ptt_active.set()
+            return          # consumer handles capture and dispatch
+    except Exception:
+        pass
+
+    # Standalone path (wake word not running)
+    if not _ptt_recording.is_set():
+        _ptt_frames.clear()
+        _ptt_recording.set()
+        print("[blue]PTT recording...[/blue]", flush=True)
+
+
+def _on_ptt_release(_event: Any) -> None:
+    """
+    PTT key released.
+
+    Mirrors _on_ptt_press: if wake word consumer is active, clear its flag.
+    Consumer finishes capture and dispatches automatically.
+    """
+    try:
+        import wake_word as _ww
+        if _ww.is_listening():
+            _ww.ptt_active.clear()
+            return
+    except Exception:
+        pass
+
+    # Standalone path
+    _ptt_recording.clear()
+
+
+
