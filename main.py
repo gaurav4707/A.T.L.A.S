@@ -399,15 +399,24 @@ def main() -> None:
             )
         started = wake_word.start_wake_word_listener()
         if started:
+            ptt_listener_started = True
+            if _ptt_wanted:
+                ptt_listener_started = voice.start_ptt_listener()
+
             mode_parts = []
             if _wake_wanted and _wake_available:
                 mode_parts.append(f"wake word ('{wake_word._wake_phrase()}')")
-            if _ptt_wanted:
+            if _ptt_wanted and ptt_listener_started:
                 mode_parts.append(f"PTT (hold '{settings.get('voice_key') or 'f8'}')")
             print(
                 f"[green][voice] Active: {' + '.join(mode_parts)}[/green]",
                 flush=True,
             )
+            if _ptt_wanted and not ptt_listener_started:
+                print(
+                    "[yellow][voice] PTT key listener failed to start; wake word remains active.[/yellow]",
+                    flush=True,
+                )
         else:
             print(
                 "[red][voice] Audio loop failed to start. Check microphone and run as administrator.[/red]",

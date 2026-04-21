@@ -6,6 +6,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -24,6 +25,78 @@ _ptt_recording = threading.Event()
 _ptt_frames: list[bytes] = []
 _ptt_press_listener: Any | None = None
 _ptt_release_listener: Any | None = None
+_ptt_poll_thread: threading.Thread | None = None
+_ptt_poll_stop_event = threading.Event()
+_ptt_hotkey: str = ""
+_ptt_last_pressed: bool = False
+
+
+def _normalize_hotkey(raw_hotkey: str) -> str:
+    """Normalize hotkey aliases so keyboard hooks resolve reliably on Windows."""
+    cleaned = raw_hotkey.strip().lower().replace("_", " ")
+    aliases = {
+        "left ctrl": "left ctrl",
+        "right ctrl": "right ctrl",
+        "left control": "left ctrl",
+        "right control": "right ctrl",
+    }
+    return aliases.get(cleaned, cleaned)
+
+
+def _vk_from_hotkey(hotkey: str) -> int | None:
+    """Map common PTT key names to Windows virtual-key codes."""
+    if hotkey.startswith("f") and hotkey[1:].isdigit():
+        try:
+            fnum = int(hotkey[1:])
+            if 1 <= fnum <= 24:
+                return 0x70 + (fnum - 1)  # VK_F1..VK_F24
+        except ValueError:
+            return None
+
+    if hotkey in {"left ctrl", "lctrl"}:
+        return 0xA2  # VK_LCONTROL
+    if hotkey in {"right ctrl", "rctrl"}:
+        return 0xA3  # VK_RCONTROL
+    if hotkey in {"ctrl", "control"}:
+        return 0x11  # VK_CONTROL
+    return None
+
+
+def _is_hotkey_pressed(hotkey: str) -> bool:
+    """Check key state with keyboard module, then Win32 fallback."""
+    try:
+        return bool(keyboard.is_pressed(hotkey))
+    except Exception:
+        pass
+
+    vk = _vk_from_hotkey(hotkey)
+    if vk is None:
+        return False
+
+    try:
+        import ctypes
+        state = ctypes.windll.user32.GetAsyncKeyState(vk)
+        return bool(state & 0x8000)
+    except Exception:
+        return False
+
+
+def _ptt_poll_loop() -> None:
+    """Fallback key-state polling path when keyboard hooks are unreliable."""
+    global _ptt_last_pressed
+
+    while not _ptt_poll_stop_event.is_set():
+        pressed = False
+        if _ptt_hotkey:
+            pressed = _is_hotkey_pressed(_ptt_hotkey)
+
+        if pressed and not _ptt_last_pressed:
+            _on_ptt_press(None)
+        elif _ptt_last_pressed and not pressed:
+            _on_ptt_release(None)
+
+        _ptt_last_pressed = pressed
+        time.sleep(0.03)
 
 
 def transcribe_from_array(audio_np: np.ndarray) -> str:
@@ -113,7 +186,9 @@ def start_ptt_listener() -> bool:
     the consumer already owns the mic and handles PTT via ptt_active.
     """
     import ctypes
-    global _ptt_press_listener, _ptt_release_listener
+    global _ptt_press_listener, _ptt_release_listener, _ptt_poll_thread, _ptt_hotkey, _ptt_last_pressed
+
+    stop_ptt_listener()
 
     try:
         is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -122,16 +197,24 @@ def start_ptt_listener() -> bool:
     if not is_admin:
         print("[yellow]PTT WARNING: Run terminal as administrator.[/yellow]", flush=True)
 
-    hotkey = str(settings.get("voice_key") or "f8")
+    raw_hotkey = str(settings.get("voice_key") or "f8")
+    hotkey = _normalize_hotkey(raw_hotkey)
+    _ptt_hotkey = hotkey
+    _ptt_last_pressed = False
 
     _ptt_stop_event.clear()
+    _ptt_poll_stop_event.clear()
 
+    hooks_ok = True
     try:
         _ptt_press_listener = keyboard.on_press_key(hotkey, _on_ptt_press)
         _ptt_release_listener = keyboard.on_release_key(hotkey, _on_ptt_release)
     except Exception as exc:
-        print(f"[red]PTT failed to register hotkey '{hotkey}': {exc}[/red]", flush=True)
-        return False
+        hooks_ok = False
+        print(f"[yellow]PTT key hook unavailable for '{hotkey}': {exc}[/yellow]", flush=True)
+
+    _ptt_poll_thread = threading.Thread(target=_ptt_poll_loop, daemon=True, name="atlas-ptt-poller")
+    _ptt_poll_thread.start()
 
     # Check whether the wake word consumer is already running
     wake_running = False
@@ -145,17 +228,16 @@ def start_ptt_listener() -> bool:
         # Consumer owns the mic — PTT is just a key signal
         print(
             f"[green]Push-to-talk active — hold {hotkey} to speak "
-            f"(routed through wake word consumer)[/green]",
+            f"(routed through wake word consumer{' / poll fallback' if not hooks_ok else ''})[/green]",
             flush=True,
         )
     else:
         # Wake word not running — start the standalone capture loop
-        from voice import _ptt_capture_loop
         thread = threading.Thread(target=_ptt_capture_loop, daemon=True)
         thread.start()
         print(
             f"[green]Push-to-talk active — hold {hotkey} to speak "
-            f"(standalone stream mode)[/green]",
+            f"(standalone stream mode{' / poll fallback' if not hooks_ok else ''})[/green]",
             flush=True,
         )
 
@@ -163,8 +245,34 @@ def start_ptt_listener() -> bool:
 
 
 def stop_ptt_listener() -> None:
-    """No-op stub — PTT is managed by wake_word._listen_loop()."""
-    pass
+    """Stop PTT key listeners and polling fallback cleanly."""
+    global _ptt_press_listener, _ptt_release_listener, _ptt_poll_thread, _ptt_last_pressed
+
+    _ptt_stop_event.set()
+    _ptt_recording.clear()
+    _ptt_poll_stop_event.set()
+    _ptt_last_pressed = False
+
+    try:
+        import wake_word as _ww
+        _ww.ptt_active.clear()
+    except Exception:
+        pass
+
+    if _ptt_press_listener is not None:
+        try:
+            keyboard.unhook(_ptt_press_listener)
+        except Exception:
+            pass
+    if _ptt_release_listener is not None:
+        try:
+            keyboard.unhook(_ptt_release_listener)
+        except Exception:
+            pass
+
+    _ptt_press_listener = None
+    _ptt_release_listener = None
+    _ptt_poll_thread = None
 
 
 def _tts_runner(cmd: list[str]) -> None:
@@ -268,6 +376,7 @@ def _on_ptt_press(_event: Any) -> None:
         import wake_word as _ww
         if _ww.is_listening():
             _ww.ptt_active.set()
+            print("[blue]PTT recording...[/blue]", flush=True)
             return          # consumer handles capture and dispatch
     except Exception:
         pass
@@ -290,6 +399,7 @@ def _on_ptt_release(_event: Any) -> None:
         import wake_word as _ww
         if _ww.is_listening():
             _ww.ptt_active.clear()
+            print("[blue]PTT released.[/blue]", flush=True)
             return
     except Exception:
         pass

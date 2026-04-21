@@ -323,6 +323,10 @@ def _consumer_loop() -> None:
 
                 # PTT preempt check (same as outer loop)
                 if ptt_active.is_set():
+                    # Preserve at least one frame so short PTT taps still dispatch.
+                    state = _State.PTT_RECORDING
+                    cap = [detect_frame.copy()]
+                    speech_started, silent_count = False, 0
                     break
 
                 pcm_bytes = detect_frame.tobytes()
@@ -353,7 +357,8 @@ def _consumer_loop() -> None:
                     # carried into the Whisper capture buffer via lingering state.
                     state = _State.CAPTURING
                     cap, speech_started, silent_count = [], False, 0
-                    drain_remaining = WAKE_DRAIN_CHUNKS
+                    # With phrase grammar detection, command speech can begin immediately.
+                    drain_remaining = 0
                     capture_deadline = time.time() + MAX_CAPTURE_SECONDS
                     break   # exit detection inner loop, outer loop continues in CAPTURING
 
