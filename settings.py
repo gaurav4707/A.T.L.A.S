@@ -23,7 +23,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "wake_word_enabled": False,
     "wake_word_backend": "vosk",
     "wake_word_phrase": "hey atlas",
-    "vosk_model_path": "vosk-model-small-en-us-0.15",
+    "vosk_model_path": "vosk-model-en-us-0.22",
     "vad_silence_ms": 1500,
     "killswitch_hotkey": "ctrl+shift+k",
     "killswitch_word": "stop",

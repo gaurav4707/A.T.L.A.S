@@ -10,7 +10,7 @@
   "wake_word_enabled": true,
   "wake_word_backend": "vosk",
   "wake_word_phrase": "hey atlas",
-  " osk_model_path": "vosk-model-small-en-us-0.15",
+  "vosk_model_path": "vosk-model-en-us-0.22",
   "vad_silence_ms": 1500,
   "killswitch_hotkey": "ctrl+shift+k",
   "killswitch_word": "stop",
@@ -28,5 +28,6 @@
   "trash_retention_days": 7,
   "log_file": "history.db",
   "api_token": "7d74eabc-15c0-499a-8e6f-bf2ed55d67c0",
+  " osk_model_path": "vosk-model-en-us-0.22",
   "voice_input_device": 1
 }

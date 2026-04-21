@@ -4,6 +4,12 @@
 
 ATLAS is a local-first command and voice assistant. Current work is on the v2 line: Python 3.11+, Windows 10/11, Node 20+, and Rust for the Tauri HUD.
 
+Before adding new detail here, prefer linking to existing docs:
+
+- [Readme.md](../Readme.md)
+- [ATLAS_Bug_Report.md](../ATLAS_Bug_Report.md)
+- [OPENWAKEWORD_MIGRATION.md](../OPENWAKEWORD_MIGRATION.md)
+
 ## Always-On Rules
 
 1. Keep the CLI working. The `atlas` entrypoint must remain valid, and `python main.py --status` should work when the launcher is unavailable.
@@ -15,6 +21,20 @@ ATLAS is a local-first command and voice assistant. Current work is on the v2 li
 7. Prefer small, testable changes. Run the relevant existing checks before and after edits.
 8. Do not create a second backend for the HUD. The Tauri/React client must use the same FastAPI service as the CLI.
 9. Chains and macros must stay on the same security path as normal commands.
+
+## Coding Conventions
+
+- Keep `from __future__ import annotations` in Python modules.
+- Use modern typing (`dict[str, Any]`, `list[str]`, `X | None`) and fully typed function signatures.
+- Keep module docstrings in new or changed Python files.
+- FastAPI and WebSocket handlers are async; keep other paths sync unless an existing async pattern already exists.
+
+## Environment Preflight
+
+- Ensure Ollama is running before assistant flows that need model inference (`ollama serve`).
+- Use the workspace venv for validation when launcher resolution is ambiguous.
+- Voice flows may require FFmpeg/FFplay and valid Windows microphone permissions.
+- Preserve graceful degradation in voice/wake flows when optional dependencies are unavailable.
 
 ## How To Run It
 
@@ -52,6 +72,7 @@ ATLAS is a local-first command and voice assistant. Current work is on the v2 li
 - `atlas` may point to the wrong Python install on this machine; prefer the workspace venv when validating changes.
 - ChromaDB collection reads return ids automatically; do not pass an `ids` include key.
 - The voice stack is expected to degrade gracefully when wake-word or audio dependencies are unavailable.
+- Keep critical fixes from [ATLAS_Bug_Report.md](../ATLAS_Bug_Report.md) intact unless a replacement fix is fully validated.
 
 ## Notes For Future Work
 

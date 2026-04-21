@@ -226,3 +226,4 @@ error.log
 *.mp3
 pip_cache/
 *.whl
+vosk-model-en-us-0.22/

@@ -2,13 +2,14 @@
 
 # Architecture: one producer thread owns the mic and puts raw int16 frames
 # into _audio_queue.  One consumer thread reads from that queue and runs a
-# state machine: DETECTING → CAPTURING → back to DETECTING.  PTT pauses OWW
+# state machine: DETECTING → CAPTURING → back to DETECTING.  PTT pauses wake
 # and redirects captured frames through the same Whisper/dispatch path.
 # This eliminates the PaErrorCode -9983 crash that occurred when a second
 # InputStream was opened while the first was still alive.
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
@@ -18,6 +19,7 @@ from typing import Any
 
 import numpy as np
 import sounddevice as sd
+from vosk import KaldiRecognizer, Model as VoskModel
 
 import classifier
 import executor
@@ -27,9 +29,9 @@ import settings
 import voice
 
 SAMPLE_RATE = 16_000
-CHUNK = 1_280                # 80 ms — required by openWakeWord
+CHUNK = 1_280                # 80 ms
 
-COOLDOWN_SECONDS = 2.0       # Minimum gap between consecutive wake triggers
+COOLDOWN = 2.0               # minimum seconds between triggers
 SPEECH_ENERGY = 800          # int16 peak to consider "speech started / still speaking"
 MAX_SILENT_CHUNKS = 19       # ~1.5 s of silence → end of utterance
 MAX_CAPTURE_SECONDS = 5.0    # Hard cap on command capture window
@@ -37,7 +39,7 @@ WAKE_DRAIN_CHUNKS = 4        # Frames to discard after trigger (~320 ms of wake 
 
 
 class _State(Enum):
-    DETECTING = auto()       # OWW running; looking for wake phrase
+    DETECTING = auto()       # Wake detector running; looking for wake phrase
     CAPTURING = auto()       # Wake triggered; collecting command audio
     PTT_RECORDING = auto()   # PTT key held; collecting audio for push-to-talk
 
@@ -56,10 +58,9 @@ _producer_thread: threading.Thread | None = None
 _consumer_thread: threading.Thread | None = None
 _watchdog_thread: threading.Thread | None = None
 
-_oww_model: Any | None = None
-_available: bool | None = None
-_active_backend_model: str = ""
-_cooldown_until: float = 0.0
+_vosk_model: VoskModel | None = None
+_vosk_loaded: bool = False
+_last_trigger_time: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -76,81 +77,54 @@ def _broadcast_event(payload: dict[str, str]) -> None:
         pass
 
 
-def _resolve_backend_model() -> str:
-    configured = str(settings.get("wake_word_model") or "hey_atlas").strip().lower()
-    return "hey_jarvis" if configured == "hey_atlas" else configured
-
-
 def _wake_phrase() -> str:
-    """Return the phrase the model actually listens for (not just config value)."""
-    if _active_backend_model and _active_backend_model not in ("", "auto"):
-        return _active_backend_model.replace("_", " ")
-    return str(settings.get("wake_word_model") or "hey_atlas").replace("_", " ")
-
-
-def _candidate_models() -> list[str]:
-    preferred = _resolve_backend_model()
-    extras = ["hey_mycroft", "alexa", "computer"] if preferred == "hey_jarvis" else []
-    seen: set[str] = set()
-    result: list[str] = []
-    for m in [preferred] + extras:
-        if m not in seen:
-            result.append(m)
-            seen.add(m)
-    return result
+    return str(settings.get("wake_word_phrase") or "hey atlas")
 
 
 # ---------------------------------------------------------------------------
-# OWW model loading
+# Vosk model loading
 # ---------------------------------------------------------------------------
 
-def _load_model() -> bool:
-    global _oww_model, _available, _active_backend_model
+def _load_vosk_model() -> bool:
+    global _vosk_model, _vosk_loaded
 
-    if _available is True and _oww_model is not None:
+    if _vosk_loaded and _vosk_model is not None:
         return True
-    if _available is False:
+    if _vosk_loaded and _vosk_model is None:
         return False
 
-    try:
-        from openwakeword.model import Model as OWWModel
-    except Exception as exc:
-        _oww_model = None
-        _available = False
-        print(f"[yellow]openWakeWord import failed: {exc}[/yellow]", flush=True)
-        return False
-
-    for name in _candidate_models():
-        try:
-            _oww_model = OWWModel(wakeword_models=[name], inference_framework="onnx")
-            _active_backend_model = name
-            _available = True
-            preferred = _resolve_backend_model()
-            if name != preferred:
-                print(
-                    f"[yellow]Wake model '{preferred}' unavailable — using '{name}'.[/yellow]\n"
-                    f"[yellow]Say '{name.replace('_', ' ')}' to activate ATLAS.[/yellow]",
-                    flush=True,
-                )
-            return True
-        except Exception:
-            continue
+    model_path = str(settings.get("vosk_model_path") or "vosk-model-small-en-us-0.15")
 
     try:
-        _oww_model = OWWModel(inference_framework="onnx")
-        _active_backend_model = "auto"
-        _available = True
+        import os
+        if not os.path.isdir(model_path):
+            print(
+                f"[red]Vosk model not found at '{model_path}'.[/red]\n"
+                f"[yellow]Download from https://alphacephei.com/vosk/models[/yellow]\n"
+                f"[yellow]Extract and place the folder in your atlas/ directory.[/yellow]",
+                flush=True,
+            )
+            _vosk_loaded = True
+            _vosk_model = None
+            return False
+
+        import logging
+        logging.getLogger("vosk").setLevel(logging.ERROR)
+        _vosk_model = VoskModel(model_path)
+        _vosk_loaded = True
+        phrase = str(settings.get("wake_word_phrase") or "hey atlas")
+        print(f"[green]Vosk loaded — listening for '{phrase}'[/green]", flush=True)
         return True
+
     except Exception as exc:
-        _oww_model = None
-        _available = False
-        print(f"[yellow]openWakeWord failed to load any model: {exc}[/yellow]", flush=True)
+        print(f"[red]Vosk model failed to load: {exc}[/red]", flush=True)
+        _vosk_model = None
+        _vosk_loaded = True
         return False
 
 
 def is_available() -> bool:
-    """Return True when the OWW backend can be loaded."""
-    return _load_model()
+    return _load_vosk_model()
 
 
 # ---------------------------------------------------------------------------
@@ -268,9 +242,9 @@ def _consumer_loop() -> None:
 
     State transitions
     -----------------
-    DETECTING     → OWW.predict() on every frame
-                  → score > threshold AND cooldown expired
-                  → CAPTURING  (sets _cooldown_until, drains WAKE_DRAIN_CHUNKS)
+    DETECTING     → Vosk grammar spotting for wake phrase
+                  → phrase hit AND cooldown expired
+                  → CAPTURING  (drains WAKE_DRAIN_CHUNKS)
 
     CAPTURING     → skip WAKE_DRAIN_CHUNKS frames (contain wake-word audio,
                     feeding them to Whisper causes phonetic hallucinations)
@@ -284,11 +258,9 @@ def _consumer_loop() -> None:
     PTT preempts everything: if ptt_active is set mid-capture the in-progress
     wake-word capture is discarded and PTT collection starts fresh.
     """
-    global _cooldown_until
+    global _last_trigger_time
 
     state = _State.DETECTING
-    threshold = float(settings.get("wake_word_threshold") or 0.35)
-    session_peak: float = 0.0
 
     cap: list[np.ndarray] = []
     speech_started = False
@@ -307,7 +279,7 @@ def _consumer_loop() -> None:
             continue
 
         # ------------------------------------------------------------------
-        # PTT PRIORITY: preempts OWW in any state
+        # PTT PRIORITY: preempts wake detection in any state
         # ------------------------------------------------------------------
         if ptt_active.is_set():
             if state != _State.PTT_RECORDING:
@@ -326,51 +298,66 @@ def _consumer_loop() -> None:
             continue
 
         # ------------------------------------------------------------------
-        # DETECTING — run OWW on every frame
+        # DETECTING — run Vosk grammar spotting
         # ------------------------------------------------------------------
         if state == _State.DETECTING:
-            if _oww_model is None:
+            if _vosk_model is None:
                 continue
 
-            audio_f = frame.astype(np.float32) / 32_768.0
-            try:
-                pred = _oww_model.predict(audio_f)
-            except Exception as exc:
-                logging.warning("OWW predict error: %s", exc)
-                continue
+            # Build a fresh recognizer each time we enter DETECTING from scratch.
+            # KaldiRecognizer is stateful — resetting between captures prevents
+            # old audio state bleeding into the next detection window.
+            phrase = _wake_phrase().lower()
+            grammar = json.dumps([phrase, "[unk]"])
+            recognizer = KaldiRecognizer(_vosk_model, SAMPLE_RATE, grammar)
+            recognizer.SetWords(False)
 
-            if not isinstance(pred, dict):
-                continue
+            pending_frame: np.ndarray | None = frame
 
-            for model_name, score in pred.items():
-                score_f = float(score)
-                if score_f > 0.05:
-                    logging.debug(
-                        "OWW %s score=%.3f threshold=%.2f",
-                        model_name, score_f, threshold,
-                    )
-                if score_f > session_peak:
-                    session_peak = score_f
-                    if score_f > 0.10:
-                        print(
-                            f"[dim]Wake peak: {score_f:.3f} "
-                            f"(need >{threshold:.2f} to trigger)[/dim]",
-                            flush=True,
-                        )
+            # Detection inner loop — exits when triggered or _stop_event fires
+            while not _stop_event.is_set() and not ptt_active.is_set():
+                detect_frame = pending_frame if pending_frame is not None else _get_frame()
+                pending_frame = None
+                if detect_frame is None:
+                    continue
 
-            now = time.time()
-            triggered = any(float(s) > threshold for s in pred.values())
-            if triggered and now >= _cooldown_until:
-                # Set cooldown BEFORE transitioning — prevents re-entry
-                _cooldown_until = now + COOLDOWN_SECONDS
+                # PTT preempt check (same as outer loop)
+                if ptt_active.is_set():
+                    break
 
-                print("\n[blue]ATLAS: Listening...[/blue]", flush=True)
-                _broadcast_event({"type": "listening_start"})
+                pcm_bytes = detect_frame.tobytes()
+                accepted = recognizer.AcceptWaveform(pcm_bytes)
 
-                state = _State.CAPTURING
-                cap, speech_started, silent_count = [], False, 0
-                drain_remaining = WAKE_DRAIN_CHUNKS
-                capture_deadline = time.time() + MAX_CAPTURE_SECONDS
+                if accepted:
+                    result = json.loads(recognizer.Result())
+                    text = result.get("text", "").lower().strip()
+                else:
+                    # Partial result check — catches phrase before utterance ends
+                    partial = json.loads(recognizer.PartialResult())
+                    text = partial.get("partial", "").lower().strip()
+
+                if phrase in text:
+                    now = time.time()
+                    if now - _last_trigger_time < COOLDOWN:
+                        # Debounce — same utterance still scoring, reset recognizer
+                        recognizer = KaldiRecognizer(_vosk_model, SAMPLE_RATE, grammar)
+                        recognizer.SetWords(False)
+                        continue
+
+                    _last_trigger_time = now
+
+                    print("\n[blue]ATLAS: Listening...[/blue]", flush=True)
+                    _broadcast_event({"type": "listening_start"})
+
+                    # Transition to CAPTURING — reset recognizer so wake audio is not
+                    # carried into the Whisper capture buffer via lingering state.
+                    state = _State.CAPTURING
+                    cap, speech_started, silent_count = [], False, 0
+                    drain_remaining = WAKE_DRAIN_CHUNKS
+                    capture_deadline = time.time() + MAX_CAPTURE_SECONDS
+                    break   # exit detection inner loop, outer loop continues in CAPTURING
+
+            # If ptt_active broke us out, outer loop handles PTT_RECORDING transition
             continue
 
         # ------------------------------------------------------------------
@@ -447,8 +434,8 @@ def start_wake_word_listener() -> bool:
     """Start producer, consumer, and watchdog threads."""
     global _producer_thread, _consumer_thread, _watchdog_thread
 
-    if not _load_model():
-        print("[yellow]Wake word backend unavailable — wake word disabled[/yellow]", flush=True)
+    if not _load_vosk_model():
+        print("[yellow]Vosk backend unavailable — wake word disabled[/yellow]", flush=True)
         return False
 
     _stop_event.clear()
