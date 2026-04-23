@@ -9,6 +9,7 @@ Before adding new detail here, prefer linking to existing docs:
 - [Readme.md](../Readme.md)
 - [ATLAS_Bug_Report.md](../ATLAS_Bug_Report.md)
 - [OPENWAKEWORD_MIGRATION.md](../OPENWAKEWORD_MIGRATION.md)
+- Treat `.github/prompts/*.prompt.md` as workflow helpers, not architecture source of truth.
 
 ## Always-On Rules
 
@@ -21,6 +22,7 @@ Before adding new detail here, prefer linking to existing docs:
 7. Prefer small, testable changes. Run the relevant existing checks before and after edits.
 8. Do not create a second backend for the HUD. The Tauri/React client must use the same FastAPI service as the CLI.
 9. Chains and macros must stay on the same security path as normal commands.
+10. Keep voice/PTT robustness fixes from [ATLAS_Bug_Report.md](../ATLAS_Bug_Report.md) active unless a replacement is tested.
 
 ## Coding Conventions
 
@@ -38,6 +40,7 @@ Before adding new detail here, prefer linking to existing docs:
 
 ## How To Run It
 
+- Install in editable mode: `python -m pip install -e .`
 - Setup and health checks: `atlas --setup`, `atlas --status`
 - Single command: `atlas "<command>"`
 - Preview only: `atlas --dry "<command>"`
@@ -71,6 +74,7 @@ Before adding new detail here, prefer linking to existing docs:
 - `settings.get()` is key-only in this repo; use `settings.get(key) or default`.
 - `atlas` may point to the wrong Python install on this machine; prefer the workspace venv when validating changes.
 - ChromaDB collection reads return ids automatically; do not pass an `ids` include key.
+- For keyboard hooks in PTT flows, unhook with `keyboard.unhook(handle)` rather than `keyboard.remove_hotkey()`.
 - The voice stack is expected to degrade gracefully when wake-word or audio dependencies are unavailable.
 - Keep critical fixes from [ATLAS_Bug_Report.md](../ATLAS_Bug_Report.md) intact unless a replacement fix is fully validated.
 

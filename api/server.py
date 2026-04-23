@@ -95,6 +95,33 @@ async def dry_run(
 
     final_text = text or str(body_data.get("text") or "")
     result = classifier.classify(final_text) or llm_engine.query(final_text, memory.get_context_for_llm(final_text))
+
+    params = result.get("params", {})
+    if not isinstance(params, dict):
+        params = {}
+
+    target = str(params.get("path") or params.get("target") or "(no file specified)")
+    risk = str(result.get("risk") or "low").lower()
+    gate = "none"
+    if risk == "medium":
+        gate = "yes confirmation"
+    elif risk == "high":
+        gate = "PIN required"
+    elif risk == "critical":
+        gate = "blocked"
+
+    await ws_manager.broadcast(
+        {
+            "type": "dry_run",
+            "data": {
+                "text": final_text,
+                "action": str(result.get("action") or "unknown"),
+                "target": target,
+                "risk": risk,
+                "gate": gate,
+            },
+        }
+    )
     return result
 
 
