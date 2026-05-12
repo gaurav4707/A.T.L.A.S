@@ -1,0 +1,157 @@
+"""ATLAS LLM engine wrapper for Ollama with strict JSON output handling."""
+
+from __future__ import annotations
+
+import json
+import threading
+from typing import Any
+
+import ollama
+
+import settings
+
+SAFE_FALLBACK: dict[str, Any] = {
+    "intent": "unknown",
+    "action": "unknown",
+    "params": {},
+    "response": "I did not understand that. Could you rephrase?",
+    "risk": "low",
+}
+
+_ALLOWED_RISK = {"low", "medium", "high", "critical"}
+VALID_ACTIONS = {
+    "open_app",
+    "close_app",
+    "web_search",
+    "open_url",
+    "set_volume",
+    "mute_volume",
+    "sleep_pc",
+    "shutdown_pc",
+    "restart_pc",
+    "create_file",
+    "rename_file",
+    "move_file",
+    "delete_file",
+    "clipboard_read",
+    "clipboard_write",
+    "get_time",
+    "run_macro",
+    "unknown",
+}
+
+killswitch_event = threading.Event()
+
+# Grammar guidance for llama.cpp-compatible JSON shape constraints.
+_GBNF_GRAMMAR = """
+root ::= object
+object ::= "{" ws "\"intent\"" ws ":" ws string ws "," ws "\"action\"" ws ":" ws string ws "," ws "\"params\"" ws ":" ws params ws "," ws "\"response\"" ws ":" ws string ws "," ws "\"risk\"" ws ":" ws risk ws "}"
+risk ::= "\"low\"" | "\"medium\"" | "\"high\"" | "\"critical\""
+params ::= "{" ws [pair (ws "," ws pair)*] ws "}"
+pair ::= string ws ":" ws value
+value ::= string | number | "true" | "false" | "null" | params | array
+array ::= "[" ws [value (ws "," ws value)*] ws "]"
+string ::= "\"" chars "\""
+chars ::= "" | char chars
+char ::= [^"\\] | "\\" ["\\/bfnrt]
+number ::= [0-9]+
+ws ::= [ \t\n\r]*
+""".strip()
+
+
+def _build_prompt(user_prompt: str, context_str: Any) -> str:
+    """Build the full prompt with preassembled context and JSON constraints."""
+    context_block = ""
+    if isinstance(context_str, str):
+        cleaned = context_str.strip()
+        if cleaned:
+            context_block = cleaned + "\n\n"
+    elif context_str:
+        context_lines = [str(item) for item in context_str if str(item).strip()]
+        if context_lines:
+            context_block = "\n".join(context_lines).strip() + "\n\n"
+
+    return (
+        "You are ATLAS command parser.\n"
+        "Return ONLY valid JSON matching this exact object shape:\n"
+        "{\"intent\": str, \"action\": str, \"params\": dict, \"response\": str, \"risk\": str}.\n"
+        "You must respond ONLY with valid JSON. The 'action' field must be EXACTLY one of these values - no other values are allowed:\n"
+        "open_app, close_app, web_search, open_url, set_volume, mute_volume,\n"
+        "sleep_pc, shutdown_pc, restart_pc, create_file, rename_file, move_file,\n"
+        "delete_file, clipboard_read, clipboard_write, get_time, run_macro, unknown.\n\n"
+        "If the user's intent does not match any of these, use action: 'unknown'.\n"
+        "For conversational messages or questions that are not commands, return action: 'unknown' and put your reply in the 'response' field.\n"
+        "NEVER invent new action names like 'delete', 'file_deletion', 'respond',\n"
+        "'sayHello', 'recall', or anything else not in this list.\n"
+        "Risk must be one of: low, medium, high, critical.\n"
+        "Do not include markdown or explanations.\n"
+        "Use this llama.cpp GBNF grammar guidance:\n"
+        f"{_GBNF_GRAMMAR}\n\n"
+        f"{context_block}"
+        f"User input: {user_prompt}"
+    )
+
+
+def _validate_payload(data: Any) -> dict[str, Any] | None:
+    """Validate parsed JSON payload against required fields and values."""
+    if not isinstance(data, dict):
+        return None
+
+    required = {"intent", "action", "params", "response", "risk"}
+    if set(data.keys()) != required:
+        return None
+
+    if not isinstance(data["intent"], str):
+        return None
+    if not isinstance(data["action"], str):
+        return None
+    if not isinstance(data["params"], dict):
+        return None
+    if not isinstance(data["response"], str):
+        return None
+    if not isinstance(data["risk"], str):
+        return None
+    if data["risk"] not in _ALLOWED_RISK:
+        return None
+
+    return data
+
+
+def _safe_json(raw: str) -> dict[str, Any] | None:
+    """Parse and validate a candidate JSON response string."""
+    try:
+        parsed: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+    if isinstance(parsed, dict):
+        action = parsed.get("action")
+        if action not in VALID_ACTIONS:
+            parsed["action"] = "unknown"
+
+    return _validate_payload(parsed)
+
+
+def query(prompt: str, context_str: str) -> dict[str, Any]:
+    """Query the configured Ollama model and return a safe structured payload."""
+    model_name = str(settings.get("model") or "mistral:7b")
+    full_prompt = _build_prompt(prompt, context_str)
+
+    attempts = 0
+    while attempts < 2:
+        if killswitch_event.is_set():
+            return dict(SAFE_FALLBACK)
+
+        attempts += 1
+        try:
+            response = ollama.generate(model=model_name, prompt=full_prompt)
+            if killswitch_event.is_set():
+                return dict(SAFE_FALLBACK)
+            text = str(response.get("response", "")).strip()
+            payload = _safe_json(text)
+            if payload is not None:
+                return payload
+        except Exception:
+            continue
+
+    return dict(SAFE_FALLBACK)
