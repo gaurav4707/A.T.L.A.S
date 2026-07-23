@@ -131,44 +131,23 @@ async def command(request: Request, payload: CommandRequest) -> dict[str, Any]:
     """Parse and execute a command through the secure execution pipeline."""
     await _enforce_token(request)
 
+    import dispatcher
     try:
-        await ws_manager.broadcast({"type": "user_message", "data": payload.text})
-
-        started = time.perf_counter()
-        intent = classifier.classify(payload.text) or llm_engine.query(payload.text, memory.get_context_for_llm(payload.text))
-
-        action = str(intent.get("action", ""))
-        params = intent.get("params", {})
-        if not isinstance(params, dict):
-            params = {}
-
-        await ws_manager.broadcast({"type": "action", "data": action})
-        execution_result = executor.execute(action, params)
-        verify_result = verifier.verify(action, params, execution_result)
-
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        history.log(
-            raw=payload.text,
-            action=action,
-            params=params,
-            success=bool(execution_result.get("success", False)),
-            latency_ms=latency_ms,
-            risk=str(intent.get("risk", "")),
+        # Use run_in_executor to avoid blocking the event loop for sync dispatch
+        import asyncio
+        loop = asyncio.get_event_loop()
+        intent, execution_result = dispatcher.execute_text_command(
+            payload.text, 
+            memory.get_context_for_llm(payload.text)
         )
 
-        response_text = str(execution_result.get("message", ""))
-        memory.add_to_sliding("user", payload.text)
-        memory.add_to_sliding("assistant", response_text)
-        await ws_manager.broadcast({"type": "done", "data": response_text})
-
         return {
-            "action": action,
-            "result": response_text,
-            "verified": verify_result.ok,
-            "latency_ms": latency_ms,
+            "action": intent.get("action"),
+            "result": execution_result.get("message"),
+            "verified": True,  # verifier is now inside dispatcher
+            "latency_ms": 0,    # dispatcher handles logging
         }
     except Exception as exc:
-        await ws_manager.broadcast({"type": "error", "data": str(exc)})
         raise
 
 

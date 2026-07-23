@@ -162,40 +162,8 @@ def _execute_text_command(
     context_str: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Execute one free-text command and log its outcome in history."""
-    started = time.perf_counter()
-    parsed = _classify_or_query(text, context_str)
-
-    action = str(parsed.get("action", ""))
-    params = parsed.get("params", {})
-    if not isinstance(params, dict):
-        params = {}
-
-    execution_result = executor.execute(action, params)
-    
-    # For unknown actions, preserve conversational response but keep KPI/history unsuccessful.
-    if action == "unknown" and parsed.get("response"):
-        execution_result = {
-            "success": False,
-            "message": str(parsed.get("response", "")),
-        }
-    
-    latency_ms = int((time.perf_counter() - started) * 1000)
-    history.log(
-        raw=text,
-        action=action,
-        params=params,
-        success=bool(execution_result.get("success", False)),
-        latency_ms=latency_ms,
-        risk=str(parsed.get("risk", "")),
-    )
-
-    assistant_response = str(parsed.get("response", execution_result.get("message", "")))
-    memory.add_to_sliding("user", text)
-    memory.add_to_sliding("assistant", assistant_response)
-
-    voice.speak(assistant_response)
-
-    return parsed, execution_result
+    import dispatcher
+    return dispatcher.execute_text_command(text, context_str)
 
 
 def _dry_run_panel(text: str, context_str: str) -> None:

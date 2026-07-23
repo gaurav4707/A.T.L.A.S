@@ -1,15 +1,12 @@
 """wake_word.py — SPMC audio pipeline for ATLAS wake word and PTT."""
 
 # Architecture: one producer thread owns the mic and puts raw int16 frames
-# into _audio_queue.  One consumer thread reads from that queue and runs a
-# state machine: DETECTING → CAPTURING → back to DETECTING.  PTT pauses wake
+# into _audio_queue. One consumer thread reads from that queue and runs a
+# state machine: DETECTING → CAPTURING → back to DETECTING. PTT pauses wake
 # and redirects captured frames through the same Whisper/dispatch path.
-# This eliminates the PaErrorCode -9983 crash that occurred when a second
-# InputStream was opened while the first was still alive.
 
 from __future__ import annotations
 
-import json
 import logging
 import queue
 import threading
@@ -19,7 +16,7 @@ from typing import Any
 
 import numpy as np
 import sounddevice as sd
-from vosk import KaldiRecognizer, Model as VoskModel
+from openwakeword.model import Model
 
 import classifier
 import executor
@@ -29,13 +26,13 @@ import settings
 import voice
 
 SAMPLE_RATE = 16_000
-CHUNK = 1_280                # 80 ms
+CHUNK = 1_280                # 80 ms (OpenWakeWord expects 80ms chunks for optimal performance)
 
 COOLDOWN = 2.0               # minimum seconds between triggers
 SPEECH_ENERGY = 800          # int16 peak to consider "speech started / still speaking"
 MAX_SILENT_CHUNKS = 19       # ~1.5 s of silence → end of utterance
-MAX_CAPTURE_SECONDS = 5.0    # Hard cap on command capture window
-WAKE_DRAIN_CHUNKS = 4        # Frames to discard after trigger (~320 ms of wake audio)
+MAX_CAPTURE_SECONDS = 7.0    # Hard cap on command capture window
+WAKE_DRAIN_CHUNKS = 0        # OWW doesn't need to drain as much as Vosk
 
 
 class _State(Enum):
@@ -58,8 +55,7 @@ _producer_thread: threading.Thread | None = None
 _consumer_thread: threading.Thread | None = None
 _watchdog_thread: threading.Thread | None = None
 
-_vosk_model: VoskModel | None = None
-_vosk_loaded: bool = False
+_OWW_MODEL: Model | None = None
 _last_trigger_time: float = 0.0
 
 
@@ -67,64 +63,43 @@ _last_trigger_time: float = 0.0
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _broadcast_event(payload: dict[str, str]) -> None:
+def _broadcast_event(payload: dict[str, Any]) -> None:
     """Best-effort WebSocket broadcast for HUD state updates."""
     try:
         from api.ws_manager import ws_manager
         import asyncio
-        asyncio.run(ws_manager.broadcast(payload))
+        # We check if a loop is already running to avoid issues in some environments
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(ws_manager.broadcast(payload))
+            else:
+                loop.run_until_complete(ws_manager.broadcast(payload))
+        except RuntimeError:
+            asyncio.run(ws_manager.broadcast(payload))
     except Exception:
         pass
 
 
-def _wake_phrase() -> str:
-    return str(settings.get("wake_word_phrase") or "hey atlas")
+def _get_wakeword_model() -> Model | None:
+    """Initialize OpenWakeWord model from settings."""
+    global _OWW_MODEL
+    if _OWW_MODEL is not None:
+        return _OWW_MODEL
 
-
-# ---------------------------------------------------------------------------
-# Vosk model loading
-# ---------------------------------------------------------------------------
-
-def _load_vosk_model() -> bool:
-    global _vosk_model, _vosk_loaded
-
-    if _vosk_loaded and _vosk_model is not None:
-        return True
-    if _vosk_loaded and _vosk_model is None:
-        return False
-
-    model_path = str(settings.get("vosk_model_path") or "vosk-model-small-en-us-0.15")
-
+    model_name = str(settings.get("wake_word_model") or "hey_jarvis")
     try:
-        import os
-        if not os.path.isdir(model_path):
-            print(
-                f"[red]Vosk model not found at '{model_path}'.[/red]\n"
-                f"[yellow]Download from https://alphacephei.com/vosk/models[/yellow]\n"
-                f"[yellow]Extract and place the folder in your atlas/ directory.[/yellow]",
-                flush=True,
-            )
-            _vosk_loaded = True
-            _vosk_model = None
-            return False
-
-        import logging
-        logging.getLogger("vosk").setLevel(logging.ERROR)
-        _vosk_model = VoskModel(model_path)
-        _vosk_loaded = True
-        phrase = str(settings.get("wake_word_phrase") or "hey atlas")
-        print(f"[green]Vosk loaded — listening for '{phrase}'[/green]", flush=True)
-        return True
-
+        # OpenWakeWord will download models automatically on first run
+        _OWW_MODEL = Model(wakeword_models=[model_name], inference_framework="onnx")
+        print(f"[green]OpenWakeWord loaded — listening for '{model_name}'[/green]", flush=True)
+        return _OWW_MODEL
     except Exception as exc:
-        print(f"[red]Vosk model failed to load: {exc}[/red]", flush=True)
-        _vosk_model = None
-        _vosk_loaded = True
-        return False
+        print(f"[red]OpenWakeWord failed to load: {exc}[/red]", flush=True)
+        return None
 
 
 def is_available() -> bool:
-    return _load_vosk_model()
+    return _get_wakeword_model() is not None
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +111,7 @@ def _producer_loop() -> None:
     Owns the microphone exclusively.
 
     Reads CHUNK-sized int16 frames from sounddevice and puts copies into
-    _audio_queue.  Never opened concurrently with any other InputStream.
-    If the queue is full the oldest frame is discarded (real-time priority).
+    _audio_queue. Never opened concurrently with any other InputStream.
     """
     device = settings.get("voice_input_device")
     device_index = int(device) if device is not None else None
@@ -154,9 +128,10 @@ def _producer_loop() -> None:
 
         try:
             with sd.InputStream(**kwargs) as stream:
-                threshold = float(settings.get("wake_word_threshold") or 0.35)
+                model_name = str(settings.get("wake_word_model") or "hey_jarvis")
+                threshold = float(settings.get("wake_word_threshold") or 0.5)
                 print(
-                    f"[green]Mic open — say '{_wake_phrase()}' "
+                    f"[green]Mic open — say '{model_name}' "
                     f"(threshold: {threshold:.2f})[/green]",
                     flush=True,
                 )
@@ -196,7 +171,7 @@ def _get_frame() -> np.ndarray | None:
 
 
 def _dispatch_command(audio_i16: np.ndarray) -> None:
-    """Transcribe and execute one command.  Runs in a disposable thread."""
+    """Transcribe and execute one command."""
     text = voice.transcribe_from_array(audio_i16)
     normalized = text.strip().lower()
 
@@ -205,27 +180,9 @@ def _dispatch_command(audio_i16: np.ndarray) -> None:
         return
 
     print(f"[dim]Heard: {normalized}[/dim]", flush=True)
-
-    ks_word = str(settings.get("killswitch_word") or "stop").lower()
-    if normalized == ks_word:
-        try:
-            import killswitch as _ks
-            _ks.fire()
-        except Exception:
-            pass
-        return
-
-    ctx = memory.get_context_for_llm(normalized)
-    parsed = classifier.classify(normalized) or llm_engine.query(normalized, ctx)
-    action = str(parsed.get("action", ""))
-    params = parsed.get("params", {})
-    if not isinstance(params, dict):
-        params = {}
-    result = executor.execute(action, params)
-    resp = str(result.get("message", "Done."))
-    memory.add_to_sliding("user", normalized)
-    memory.add_to_sliding("assistant", resp)
-    voice.speak(resp)
+    
+    import dispatcher
+    dispatcher.execute_text_command(normalized, memory.get_context_for_llm(normalized))
 
 
 def _fire_dispatch(chunks: list[np.ndarray]) -> None:
@@ -238,140 +195,78 @@ def _fire_dispatch(chunks: list[np.ndarray]) -> None:
 
 def _consumer_loop() -> None:
     """
-    Single consumer.  Routes audio frames via a strict state machine.
-
-    State transitions
-    -----------------
-    DETECTING     → Vosk grammar spotting for wake phrase
-                  → phrase hit AND cooldown expired
-                  → CAPTURING  (drains WAKE_DRAIN_CHUNKS)
-
-    CAPTURING     → skip WAKE_DRAIN_CHUNKS frames (contain wake-word audio,
-                    feeding them to Whisper causes phonetic hallucinations)
-                  → collect frames until silence or hard-cap
-                  → _fire_dispatch() → back to DETECTING
-
-    PTT_RECORDING → entered whenever ptt_active is set (any previous state)
-                  → collect frames until ptt_active clears
-                  → _fire_dispatch() → back to DETECTING
-
-    PTT preempts everything: if ptt_active is set mid-capture the in-progress
-    wake-word capture is discarded and PTT collection starts fresh.
+    Single consumer. Routes audio frames via a strict state machine.
     """
     global _last_trigger_time
 
-    state = _State.DETECTING
+    model = _get_wakeword_model()
+    if model is None:
+        print("[red]Consumer loop aborted: Model not loaded.[/red]", flush=True)
+        return
 
+    state = _State.DETECTING
     cap: list[np.ndarray] = []
     speech_started = False
     silent_count = 0
     capture_deadline: float = 0.0
     drain_remaining = 0
 
+    model_name = str(settings.get("wake_word_model") or "hey_jarvis")
+    threshold = float(settings.get("wake_word_threshold") or 0.5)
+
     while not _stop_event.is_set():
         frame = _get_frame()
         if frame is None:
-            # Queue timeout — check if PTT was released while idle
             if state == _State.PTT_RECORDING and not ptt_active.is_set():
                 _fire_dispatch(cap)
                 cap, speech_started, silent_count = [], False, 0
                 state = _State.DETECTING
             continue
 
-        # ------------------------------------------------------------------
-        # PTT PRIORITY: preempts wake detection in any state
-        # ------------------------------------------------------------------
+        # PTT PRIORITY
         if ptt_active.is_set():
             if state != _State.PTT_RECORDING:
-                # Discard any in-progress wake-word capture cleanly
                 cap, speech_started, silent_count = [], False, 0
                 drain_remaining = 0
                 state = _State.PTT_RECORDING
             cap.append(frame.copy())
             continue
 
-        # PTT key was released → finalise
         if state == _State.PTT_RECORDING:
             _fire_dispatch(cap)
             cap, speech_started, silent_count = [], False, 0
             state = _State.DETECTING
             continue
 
-        # ------------------------------------------------------------------
-        # DETECTING — run Vosk grammar spotting
-        # ------------------------------------------------------------------
+        # DETECTING
         if state == _State.DETECTING:
-            if _vosk_model is None:
+            if _OWW_MODEL is None:
                 continue
 
-            # Build a fresh recognizer each time we enter DETECTING from scratch.
-            # KaldiRecognizer is stateful — resetting between captures prevents
-            # old audio state bleeding into the next detection window.
-            phrase = _wake_phrase().lower()
-            grammar = json.dumps([phrase, "[unk]"])
-            recognizer = KaldiRecognizer(_vosk_model, SAMPLE_RATE, grammar)
-            recognizer.SetWords(False)
-
-            pending_frame: np.ndarray | None = frame
-
-            # Detection inner loop — exits when triggered or _stop_event fires
-            while not _stop_event.is_set() and not ptt_active.is_set():
-                detect_frame = pending_frame if pending_frame is not None else _get_frame()
-                pending_frame = None
-                if detect_frame is None:
-                    continue
-
-                # PTT preempt check (same as outer loop)
-                if ptt_active.is_set():
-                    # Preserve at least one frame so short PTT taps still dispatch.
-                    state = _State.PTT_RECORDING
-                    cap = [detect_frame.copy()]
-                    speech_started, silent_count = False, 0
-                    break
-
-                pcm_bytes = detect_frame.tobytes()
-                accepted = recognizer.AcceptWaveform(pcm_bytes)
-
-                if accepted:
-                    result = json.loads(recognizer.Result())
-                    text = result.get("text", "").lower().strip()
-                else:
-                    # Partial result check — catches phrase before utterance ends
-                    partial = json.loads(recognizer.PartialResult())
-                    text = partial.get("partial", "").lower().strip()
-
-                if phrase in text:
-                    now = time.time()
-                    if now - _last_trigger_time < COOLDOWN:
-                        # Debounce — same utterance still scoring, reset recognizer
-                        recognizer = KaldiRecognizer(_vosk_model, SAMPLE_RATE, grammar)
-                        recognizer.SetWords(False)
-                        continue
-
+            # Normalize frame for OpenWakeWord (float32, [-1, 1])
+            frame_normalized = frame.astype(np.float32) / 32768.0
+            
+            # Predict
+            prediction = _OWW_MODEL.predict(frame_normalized)
+            
+            # OpenWakeWord return a dict of scores for each model
+            score = prediction.get(model_name, 0)
+            
+            if score > threshold:
+                now = time.time()
+                if now - _last_trigger_time > COOLDOWN:
                     _last_trigger_time = now
-
                     print("\n[blue]ATLAS: Listening...[/blue]", flush=True)
                     _broadcast_event({"type": "listening_start"})
-
-                    # Transition to CAPTURING — reset recognizer so wake audio is not
-                    # carried into the Whisper capture buffer via lingering state.
+                    
                     state = _State.CAPTURING
                     cap, speech_started, silent_count = [], False, 0
-                    # With phrase grammar detection, command speech can begin immediately.
-                    drain_remaining = 0
+                    drain_remaining = WAKE_DRAIN_CHUNKS
                     capture_deadline = time.time() + MAX_CAPTURE_SECONDS
-                    break   # exit detection inner loop, outer loop continues in CAPTURING
-
-            # If ptt_active broke us out, outer loop handles PTT_RECORDING transition
             continue
 
-        # ------------------------------------------------------------------
-        # CAPTURING — skip drain frames then collect command audio
-        # ------------------------------------------------------------------
+        # CAPTURING
         if state == _State.CAPTURING:
-            # Discard frames that contain the wake word itself.
-            # Feeding these to Whisper causes it to transcribe the wake
-            # phrase phonetically (e.g. "hey jarvis" → "game jarvis").
             if drain_remaining > 0:
                 drain_remaining -= 1
                 continue
@@ -388,7 +283,6 @@ def _consumer_loop() -> None:
                     state = _State.DETECTING
                 continue
 
-            # Speech in progress
             cap.append(frame.copy())
             if energy < SPEECH_ENERGY:
                 silent_count += 1
@@ -399,7 +293,6 @@ def _consumer_loop() -> None:
             else:
                 silent_count = 0
 
-            # Hard-cap reached
             if time.time() > capture_deadline:
                 _fire_dispatch(cap)
                 cap, speech_started, silent_count = [], False, 0
@@ -411,7 +304,7 @@ def _consumer_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def _watchdog_loop() -> None:
-    """Restart dead producer or consumer every 15 seconds."""
+    """Restart dead producer or consumer."""
     while not _stop_event.is_set():
         _stop_event.wait(timeout=15)
         if _stop_event.is_set():
@@ -439,8 +332,11 @@ def start_wake_word_listener() -> bool:
     """Start producer, consumer, and watchdog threads."""
     global _producer_thread, _consumer_thread, _watchdog_thread
 
-    if not _load_vosk_model():
-        print("[yellow]Vosk backend unavailable — wake word disabled[/yellow]", flush=True)
+    if not settings.get("wake_word_enabled"):
+        return False
+
+    if not is_available():
+        print("[yellow]OpenWakeWord backend unavailable — wake word disabled[/yellow]", flush=True)
         return False
 
     _stop_event.clear()
