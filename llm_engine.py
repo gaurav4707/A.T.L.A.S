@@ -132,7 +132,7 @@ def _safe_json(raw: str) -> dict[str, Any] | None:
     return _validate_payload(parsed)
 
 
-def query(prompt: str, context_str: str) -> dict[str, Any]:
+def query(prompt: str, context_str: str, on_token: Any = None) -> dict[str, Any]:
     """Query the configured Ollama model and return a safe structured payload."""
     model_name = str(settings.get("model") or "mistral:7b")
     full_prompt = _build_prompt(prompt, context_str)
@@ -144,11 +144,17 @@ def query(prompt: str, context_str: str) -> dict[str, Any]:
 
         attempts += 1
         try:
-            response = ollama.generate(model=model_name, prompt=full_prompt)
-            if killswitch_event.is_set():
-                return dict(SAFE_FALLBACK)
-            text = str(response.get("response", "")).strip()
-            payload = _safe_json(text)
+            full_text = ""
+            for chunk in ollama.generate(model=model_name, prompt=full_prompt, stream=True):
+                if killswitch_event.is_set():
+                    return dict(SAFE_FALLBACK)
+                
+                token = chunk.get("response", "")
+                full_text += token
+                if on_token:
+                    on_token(token)
+            
+            payload = _safe_json(full_text.strip())
             if payload is not None:
                 return payload
         except Exception:
